@@ -90,6 +90,7 @@ def haversine_distance(
     lat1 = math.radians(
         latitude_1
     )
+
     lon1 = math.radians(
         longitude_1
     )
@@ -97,6 +98,7 @@ def haversine_distance(
     lat2 = math.radians(
         latitude_2
     )
+
     lon2 = math.radians(
         longitude_2
     )
@@ -113,7 +115,10 @@ def haversine_distance(
 
     a = max(
         0.0,
-        min(1.0, a),
+        min(
+            1.0,
+            a,
+        ),
     )
 
     return (
@@ -151,7 +156,9 @@ def evaluate_vessel_evidence(
 
     speed_knots = max(
         0.0,
-        float(vessel["speed_knots"]),
+        float(
+            vessel["speed_knots"]
+        ),
     )
 
     heading = float(
@@ -160,14 +167,18 @@ def evaluate_vessel_evidence(
 
     ais_gap_hours = max(
         0.0,
-        float(vessel["ais_gap_hours"]),
+        float(
+            vessel["ais_gap_hours"]
+        ),
     )
 
     reliability = max(
         0.0,
         min(
             1.0,
-            float(vessel["ais_reliability"]),
+            float(
+                vessel["ais_reliability"]
+            ),
         ),
     )
 
@@ -175,12 +186,14 @@ def evaluate_vessel_evidence(
     # 1. MOTION-BASED SOURCE ESTIMATE
     # ==================================================
 
-    estimated_position = destination_from_motion(
-        latitude=current_latitude,
-        longitude=current_longitude,
-        speed_knots=speed_knots,
-        heading_deg=heading,
-        hours=hours_back,
+    estimated_position = (
+        destination_from_motion(
+            latitude=current_latitude,
+            longitude=current_longitude,
+            speed_knots=speed_knots,
+            heading_deg=heading,
+            hours=hours_back,
+        )
     )
 
     estimated_latitude = (
@@ -189,6 +202,12 @@ def evaluate_vessel_evidence(
 
     estimated_longitude = (
         estimated_position["longitude"]
+    )
+
+    effective_hours = (
+        estimated_position[
+            "effective_hours"
+        ]
     )
 
     source_distance = haversine_distance(
@@ -201,16 +220,20 @@ def evaluate_vessel_evidence(
     # ==================================================
     # 2. PHYSICAL REACHABILITY
     #
-    # Can this vessel physically cover the distance
-    # between its current position and the reconstructed
-    # source within the investigation window?
+    # IMPORTANT:
+    # Use the SAME effective motion window used by
+    # destination_from_motion().
+    #
+    # Previously this used the entire hours_back value,
+    # which could incorrectly mark vessels hundreds of
+    # kilometres away as physically reachable.
     # ==================================================
 
     maximum_travel_distance = (
         speed_knots
         * 1.852
         * max(
-            float(hours_back),
+            effective_hours,
             1.0,
         )
     )
@@ -223,10 +246,9 @@ def evaluate_vessel_evidence(
     # ==================================================
     # 3. SOURCE COMPATIBILITY
     #
-    # This is the strongest evidence.
-    # A vessel far outside its physically possible
-    # source region should not receive strong evidence
-    # merely because it has an AIS gap.
+    # A vessel that cannot physically reach the
+    # reconstructed source receives zero trajectory
+    # compatibility.
     # ==================================================
 
     if not physically_reachable:
@@ -287,7 +309,8 @@ def evaluate_vessel_evidence(
             100.0,
             20.0
             + (
-                speed_knots - 25.0
+                speed_knots
+                - 25.0
             ) * 4.0,
         )
 
@@ -307,7 +330,7 @@ def evaluate_vessel_evidence(
     # 7. EVIDENCE FUSION
     #
     # Source compatibility dominates.
-    # AIS gaps and kinematics support the investigation.
+    # AIS gaps and kinematics are supporting indicators.
     # ==================================================
 
     evidence_score = (
@@ -324,26 +347,38 @@ def evaluate_vessel_evidence(
     flags = []
 
     if physically_reachable:
+
         flags.append(
             "PHYSICALLY REACHABLE"
         )
 
-    if source_match >= 60:
+    # IMPORTANT:
+    # A trajectory can only be marked compatible when
+    # the vessel is physically reachable AND has a strong
+    # source match.
+    if (
+        physically_reachable
+        and source_match >= 60
+    ):
+
         flags.append(
             "SOURCE TRAJECTORY COMPATIBLE"
         )
 
     if ais_gap_hours > 0:
+
         flags.append(
             "AIS GAP"
         )
 
     if kinematic_anomaly:
+
         flags.append(
             "KINEMATIC ANOMALY"
         )
 
     if reliability < 0.7:
+
         flags.append(
             "LOW AIS RELIABILITY"
         )
@@ -351,25 +386,28 @@ def evaluate_vessel_evidence(
     # ==================================================
     # 9. INTENTIONAL-DISCHARGE INDICATORS
     #
-    # We only count suspicious behaviour when the vessel
+    # Suspicious behaviour only counts when the vessel
     # is also compatible with the spill source.
     # ==================================================
 
     intentional_indicators = 0
 
     if source_match >= 60:
+
         intentional_indicators += 1
 
     if (
         source_match >= 60
         and ais_gap_hours > 0
     ):
+
         intentional_indicators += 1
 
     if (
         source_match >= 60
         and kinematic_anomaly
     ):
+
         intentional_indicators += 1
 
     # ==================================================
@@ -413,10 +451,12 @@ def evaluate_vessel_evidence(
     return {
 
         "estimated_historical_position": {
+
             "latitude": round(
                 estimated_latitude,
                 6,
             ),
+
             "longitude": round(
                 estimated_longitude,
                 6,
@@ -424,9 +464,7 @@ def evaluate_vessel_evidence(
         },
 
         "motion_estimate_hours": round(
-            estimated_position[
-                "effective_hours"
-            ],
+            effective_hours,
             2,
         ),
 

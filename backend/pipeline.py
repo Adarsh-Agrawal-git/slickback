@@ -1,4 +1,11 @@
-from investigation import evaluate_vessel_evidence
+from satellite.ais_history import (
+    load_ais_history,
+    analyze_vessel_timeline,
+)
+
+from investigation import (
+    evaluate_vessel_evidence,
+)
 
 from satellite.sentinel1 import (
     download_sentinel1_scientific,
@@ -33,6 +40,8 @@ def run_pipeline(
     end_datetime,
     hours_back,
     vessel_data_path,
+    ais_history_path,
+    observation_time,
     image_output_path,
     radius_km,
     bbox_delta,
@@ -40,27 +49,29 @@ def run_pipeline(
     min_candidate_area,
 ):
     """
-    Run the complete SlickBack investigation pipeline.
+    Real Sentinel-1 -> SAR candidate -> AIS ->
+    historical AIS investigation pipeline.
 
-    Flow:
+    Pipeline:
 
-        Sentinel-1
-            ↓
-        Preprocessing
-            ↓
-        Dark-region detection
-            ↓
-        Candidate extraction
-            ↓
-        Geographic coordinates
-            ↓
-        SAR features
-            ↓
-        AIS correlation
-            ↓
-        Vessel investigation
-            ↓
-        Evidence / assessment
+        1. Download real Sentinel-1 GRD data.
+        2. Load VV backscatter.
+        3. Convert VV to dB.
+        4. Reduce speckle.
+        5. Detect dark SAR regions.
+        6. Extract candidate regions.
+        7. Convert candidate pixels to coordinates.
+        8. Extract SAR features.
+        9. Load current AIS vessel data.
+        10. Load timestamped AIS history.
+        11. Find nearby vessels.
+        12. Evaluate vessel/source compatibility.
+        13. Analyze historical AIS trajectory and gaps.
+        14. Combine evidence.
+        15. Rank vessels for investigation.
+
+    Investigation results are leads,
+    not legal proof of responsibility.
     """
 
     # ==================================================
@@ -92,14 +103,16 @@ def run_pipeline(
     # 3. PREPROCESS
     # ==================================================
 
-    vv_db = to_db(vv)
+    vv_db = to_db(
+        vv
+    )
 
     vv_filtered = remove_speckle(
         vv_db
     )
 
     # ==================================================
-    # 4. DETECT DARK REGIONS
+    # 4. DETECT DARK SAR REGIONS
     # ==================================================
 
     (
@@ -116,7 +129,7 @@ def run_pipeline(
     )
 
     # ==================================================
-    # 5. CONVERT PIXELS TO LAT/LON
+    # 5. PIXEL -> GEOGRAPHIC COORDINATES
     # ==================================================
 
     image_height, image_width = vv.shape
@@ -142,14 +155,16 @@ def run_pipeline(
     # 6. EXTRACT SAR FEATURES
     # ==================================================
 
-    candidate_features = extract_candidate_features(
-        vv_db=vv_filtered,
-        candidate_mask=candidate_mask,
-        candidates=geographic_candidates,
+    candidate_features = (
+        extract_candidate_features(
+            vv_db=vv_filtered,
+            candidate_mask=candidate_mask,
+            candidates=geographic_candidates,
+        )
     )
 
     # ==================================================
-    # 7. LOAD AIS
+    # 7. LOAD CURRENT AIS DATA
     # ==================================================
 
     vessels = load_vessels(
@@ -157,10 +172,18 @@ def run_pipeline(
     )
 
     # ==================================================
-    # 8. AIS + INVESTIGATION
+    # 8. LOAD HISTORICAL AIS DATA
     # ==================================================
 
+    ais_history = load_ais_history(
+        ais_history_path
+    )
+
     results = []
+
+    # ==================================================
+    # 9. AIS + INVESTIGATION
+    # ==================================================
 
     for candidate in candidate_features:
 
@@ -173,62 +196,261 @@ def run_pipeline(
 
         investigated_vessels = []
 
+        # ==================================================
+        # Analyze every nearby vessel
+        # ==================================================
+
         for vessel in nearby_vessels:
 
-            evidence = evaluate_vessel_evidence(
-                vessel=vessel,
-                source_latitude=candidate["latitude"],
-                source_longitude=candidate["longitude"],
-                hours_back=hours_back,
+            # ------------------------------------------
+            # Motion/source investigation
+            # ------------------------------------------
+
+            investigation = (
+                evaluate_vessel_evidence(
+                    vessel=vessel,
+                    source_latitude=candidate["latitude"],
+                    source_longitude=candidate["longitude"],
+                    hours_back=hours_back,
+                )
             )
 
-            # Combine the existing AIS correlation
-            # with the new investigation evidence.
-            responsibility_score = (
+            # ------------------------------------------
+            # Historical AIS trajectory investigation
+            # ------------------------------------------
+
+            timeline = analyze_vessel_timeline(
+                history=ais_history,
+                mmsi=vessel["mmsi"],
+                source_latitude=candidate["latitude"],
+                source_longitude=candidate["longitude"],
+                observation_time=observation_time,
+            )
+
+            # ------------------------------------------
+            # Combine vessel information
+            # ------------------------------------------
+
+            vessel_result = {
+                **vessel,
+                "investigation": investigation,
+                "timeline": timeline,
+            }
+
+            # ------------------------------------------
+            # Historical AIS indicators
+            # ------------------------------------------
+
+            timeline_gap = timeline.get(
+                "ais_gap_hours"
+            )
+
+            ais_trajectory_compatible = timeline.get(
+                "trajectory_compatible",
+                False,
+            )
+
+            # ------------------------------------------
+            # Combined responsibility score
+            #
+            # This is an investigation priority score.
+            # It is NOT proof of responsibility.
+            # ------------------------------------------
+
+            correlation_component = (
                 0.40
                 * vessel["correlation_score"]
                 * 100.0
-                +
-                0.60
-                * evidence["evidence_score"]
             )
 
-            investigated_vessels.append({
-                **vessel,
+            investigation_component = (
+                0.50
+                * investigation["evidence_score"]
+            )
 
-                "investigation": evidence,
+            timeline_component = 0.0
 
-                "responsibility_score": round(
-                    responsibility_score,
-                    1,
-                ),
-            })
+            # Historical AIS trajectory compatibility
+            if ais_trajectory_compatible:
+                timeline_component += 10.0
 
-        # Rank using the final investigation score.
+            # Historical AIS gap
+            if (
+                timeline_gap is not None
+                and timeline_gap > 0
+            ):
+                timeline_component += min(
+                    10.0,
+                    timeline_gap * 2.0,
+                )
+
+            responsibility_score = (
+                correlation_component
+                + investigation_component
+                + timeline_component
+            )
+
+            vessel_result[
+                "responsibility_score"
+            ] = round(
+                responsibility_score,
+                1,
+            )
+
+            # ------------------------------------------
+            # Investigation flags
+            # ------------------------------------------
+
+            flags = list(
+                investigation.get(
+                    "flags",
+                    []
+                )
+            )
+
+            # Historical AIS gap
+            if (
+                timeline_gap is not None
+                and timeline_gap > 0
+            ):
+                if (
+                    "AIS TIMELINE GAP"
+                    not in flags
+                ):
+                    flags.append(
+                        "AIS TIMELINE GAP"
+                    )
+
+            # Historical AIS trajectory
+            if ais_trajectory_compatible:
+
+                if (
+                    "AIS TRAJECTORY COMPATIBLE"
+                    not in flags
+                ):
+                    flags.append(
+                        "AIS TRAJECTORY COMPATIBLE"
+                    )
+
+            # ------------------------------------------
+            # Priority classification
+            # ------------------------------------------
+
+            if (
+                ais_trajectory_compatible
+                and timeline_gap is not None
+                and timeline_gap >= 2
+            ):
+
+                priority = (
+                    "HIGH PRIORITY INVESTIGATION"
+                )
+
+            elif (
+                investigation["kinematic_anomaly"]
+                and investigation[
+                    "ais_reliability"
+                ] < 0.7
+            ):
+
+                priority = (
+                    "HIGH PRIORITY INVESTIGATION"
+                )
+
+            elif (
+                timeline_gap is not None
+                and timeline_gap > 0
+            ):
+
+                priority = (
+                    "ANOMALY REQUIRES INVESTIGATION"
+                )
+
+            elif investigation[
+                "kinematic_anomaly"
+            ]:
+
+                priority = (
+                    "ANOMALY REQUIRES INVESTIGATION"
+                )
+
+            elif investigation[
+                "source_distance_km"
+            ] <= 20:
+
+                priority = (
+                    "POTENTIALLY COMPATIBLE"
+                )
+
+            else:
+
+                priority = (
+                    "INSUFFICIENT EVIDENCE"
+                )
+
+            # ------------------------------------------
+            # Final investigation object
+            # ------------------------------------------
+
+            vessel_result[
+                "investigation"
+            ] = {
+                **investigation,
+
+                "flags": flags,
+
+                "priority": priority,
+            }
+
+            investigated_vessels.append(
+                vessel_result
+            )
+
+        # ==================================================
+        # 10. RANK VESSELS
+        # ==================================================
+
         investigated_vessels.sort(
             key=lambda vessel: (
-                vessel["responsibility_score"],
-                vessel["correlation_score"],
+                vessel[
+                    "responsibility_score"
+                ],
+                vessel[
+                    "investigation"
+                ][
+                    "evidence_score"
+                ],
             ),
             reverse=True,
         )
 
         results.append({
             "candidate": candidate,
-            "nearby_vessels": investigated_vessels,
+
+            "nearby_vessels": (
+                investigated_vessels
+            ),
         })
 
     # ==================================================
-    # 9. RETURN COMPLETE RESULT
+    # 11. RETURN COMPLETE RESULT
     # ==================================================
 
     return {
         "status": "success",
 
         "satellite": {
-            "source": "Copernicus Data Space",
-            "mission": "Sentinel-1",
-            "product": "sentinel-1-grd",
+            "source": (
+                "Copernicus Data Space"
+            ),
+
+            "mission": (
+                "Sentinel-1"
+            ),
+
+            "product": (
+                "sentinel-1-grd"
+            ),
 
             "bbox": bbox,
 
@@ -246,6 +468,32 @@ def run_pipeline(
         "detection": {
             "candidate_count": len(
                 candidate_features
+            ),
+        },
+
+        "investigation": {
+            "hours_back": hours_back,
+
+            "method": (
+                "SAR candidate detection + "
+                "AIS spatial correlation + "
+                "historical AIS timeline analysis + "
+                "motion-based source compatibility + "
+                "anomaly analysis"
+            ),
+
+            "ais_history": {
+                "enabled": True,
+
+                "source": (
+                    "Timestamped AIS history "
+                    "provided to the pipeline"
+                ),
+            },
+
+            "disclaimer": (
+                "Investigation indicators are "
+                "not legal proof of responsibility."
             ),
         },
 
