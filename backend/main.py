@@ -91,17 +91,18 @@ def analyze_spill(request: SpillRequest):
     try:
 
         result = run_pipeline(
-            latitude=request.spill_lat,
-            longitude=request.spill_lon,
-            start_datetime=start_datetime.isoformat(),
-            end_datetime=end_datetime.isoformat(),
-            vessel_data_path=vessel_data_path,
-            image_output_path=image_output_path,
-            radius_km=radius_km,
-            bbox_delta=bbox_delta,
-            image_size=image_size,
-            min_candidate_area=min_candidate_area,
-        )
+    latitude=request.spill_lat,
+    longitude=request.spill_lon,
+    start_datetime=start_datetime.isoformat(),
+    end_datetime=end_datetime.isoformat(),
+    hours_back=request.hours_back,
+    vessel_data_path=vessel_data_path,
+    image_output_path=image_output_path,
+    radius_km=radius_km,
+    bbox_delta=bbox_delta,
+    image_size=image_size,
+    min_candidate_area=min_candidate_area,
+)
 
         return result
 

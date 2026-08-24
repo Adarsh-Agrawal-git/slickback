@@ -1,3 +1,5 @@
+from investigation import evaluate_vessel_evidence
+
 from satellite.sentinel1 import (
     download_sentinel1_scientific,
     pixel_to_latlon,
@@ -29,6 +31,7 @@ def run_pipeline(
     longitude,
     start_datetime,
     end_datetime,
+    hours_back,
     vessel_data_path,
     image_output_path,
     radius_km,
@@ -37,39 +40,57 @@ def run_pipeline(
     min_candidate_area,
 ):
     """
-    Run the real Sentinel-1 -> candidate -> AIS pipeline.
+    Run the complete SlickBack investigation pipeline.
 
-    No vessel identities or spill coordinates are hardcoded.
+    Flow:
+
+        Sentinel-1
+            ↓
+        Preprocessing
+            ↓
+        Dark-region detection
+            ↓
+        Candidate extraction
+            ↓
+        Geographic coordinates
+            ↓
+        SAR features
+            ↓
+        AIS correlation
+            ↓
+        Vessel investigation
+            ↓
+        Evidence / assessment
     """
 
-    # --------------------------------------------------
-    # 1. Download REAL Sentinel-1 scientific data
-    # --------------------------------------------------
+    # ==================================================
+    # 1. DOWNLOAD REAL SENTINEL-1 DATA
+    # ==================================================
 
     acquisition = download_sentinel1_scientific(
-    latitude=latitude,
-    longitude=longitude,
-    start_datetime=start_datetime,
-    end_datetime=end_datetime,
-    output_path=image_output_path,
-    size=image_size,
-    delta=bbox_delta,
-)
+        latitude=latitude,
+        longitude=longitude,
+        start_datetime=start_datetime,
+        end_datetime=end_datetime,
+        output_path=image_output_path,
+        size=image_size,
+        delta=bbox_delta,
+    )
 
     image_path = acquisition["path"]
     bbox = acquisition["bbox"]
 
-    # --------------------------------------------------
-    # 2. Load Sentinel-1
-    # --------------------------------------------------
+    # ==================================================
+    # 2. LOAD SENTINEL-1
+    # ==================================================
 
     vv = load_sentinel1(
         image_path
     )
 
-    # --------------------------------------------------
-    # 3. Preprocess
-    # --------------------------------------------------
+    # ==================================================
+    # 3. PREPROCESS
+    # ==================================================
 
     vv_db = to_db(vv)
 
@@ -77,9 +98,9 @@ def run_pipeline(
         vv_db
     )
 
-    # --------------------------------------------------
-    # 4. Detect dark regions
-    # --------------------------------------------------
+    # ==================================================
+    # 4. DETECT DARK REGIONS
+    # ==================================================
 
     (
         candidate_mask,
@@ -94,9 +115,9 @@ def run_pipeline(
         min_area=min_candidate_area,
     )
 
-    # --------------------------------------------------
-    # 5. Convert candidate pixels to coordinates
-    # --------------------------------------------------
+    # ==================================================
+    # 5. CONVERT PIXELS TO LAT/LON
+    # ==================================================
 
     image_height, image_width = vv.shape
 
@@ -117,29 +138,27 @@ def run_pipeline(
             **location,
         })
 
-    # --------------------------------------------------
-    # 6. Extract SAR features
-    # --------------------------------------------------
+    # ==================================================
+    # 6. EXTRACT SAR FEATURES
+    # ==================================================
 
-    candidate_features = (
-        extract_candidate_features(
-            vv_db=vv_filtered,
-            candidate_mask=candidate_mask,
-            candidates=geographic_candidates,
-        )
+    candidate_features = extract_candidate_features(
+        vv_db=vv_filtered,
+        candidate_mask=candidate_mask,
+        candidates=geographic_candidates,
     )
 
-    # --------------------------------------------------
-    # 7. Load AIS data
-    # --------------------------------------------------
+    # ==================================================
+    # 7. LOAD AIS
+    # ==================================================
 
     vessels = load_vessels(
         vessel_data_path
     )
 
-    # --------------------------------------------------
-    # 8. Correlate each candidate with AIS
-    # --------------------------------------------------
+    # ==================================================
+    # 8. AIS + INVESTIGATION
+    # ==================================================
 
     results = []
 
@@ -152,14 +171,56 @@ def run_pipeline(
             radius_km=radius_km,
         )
 
+        investigated_vessels = []
+
+        for vessel in nearby_vessels:
+
+            evidence = evaluate_vessel_evidence(
+                vessel=vessel,
+                source_latitude=candidate["latitude"],
+                source_longitude=candidate["longitude"],
+                hours_back=hours_back,
+            )
+
+            # Combine the existing AIS correlation
+            # with the new investigation evidence.
+            responsibility_score = (
+                0.40
+                * vessel["correlation_score"]
+                * 100.0
+                +
+                0.60
+                * evidence["evidence_score"]
+            )
+
+            investigated_vessels.append({
+                **vessel,
+
+                "investigation": evidence,
+
+                "responsibility_score": round(
+                    responsibility_score,
+                    1,
+                ),
+            })
+
+        # Rank using the final investigation score.
+        investigated_vessels.sort(
+            key=lambda vessel: (
+                vessel["responsibility_score"],
+                vessel["correlation_score"],
+            ),
+            reverse=True,
+        )
+
         results.append({
             "candidate": candidate,
-            "nearby_vessels": nearby_vessels,
+            "nearby_vessels": investigated_vessels,
         })
 
-    # --------------------------------------------------
-    # 9. Return complete investigation result
-    # --------------------------------------------------
+    # ==================================================
+    # 9. RETURN COMPLETE RESULT
+    # ==================================================
 
     return {
         "status": "success",
@@ -168,11 +229,14 @@ def run_pipeline(
             "source": "Copernicus Data Space",
             "mission": "Sentinel-1",
             "product": "sentinel-1-grd",
+
             "bbox": bbox,
+
             "image_size": [
                 int(image_height),
                 int(image_width),
             ],
+
             "adaptive_threshold_db": round(
                 float(threshold),
                 3,
