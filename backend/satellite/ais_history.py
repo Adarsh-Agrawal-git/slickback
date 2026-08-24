@@ -16,7 +16,7 @@ def load_ais_history(path):
     """
     Load timestamped AIS observations.
 
-    This module is used for trajectory analysis.
+    Used for historical trajectory analysis.
     """
 
     df = pd.read_csv(path)
@@ -71,6 +71,12 @@ def haversine_distance(
     lat2,
     lon2,
 ):
+    """
+    Calculate great-circle distance.
+
+    Returns kilometres.
+    """
+
     earth_radius_km = 6371.0
 
     lat1 = math.radians(lat1)
@@ -89,6 +95,14 @@ def haversine_distance(
         * math.sin(dlon / 2) ** 2
     )
 
+    a = max(
+        0.0,
+        min(
+            1.0,
+            a,
+        ),
+    )
+
     return (
         2
         * earth_radius_km
@@ -96,6 +110,111 @@ def haversine_distance(
             math.sqrt(a),
             math.sqrt(1 - a),
         )
+    )
+
+
+def point_to_segment_distance(
+    point_lat,
+    point_lon,
+    start_lat,
+    start_lon,
+    end_lat,
+    end_lon,
+):
+    """
+    Approximate minimum distance in kilometres between
+    a geographic point and the AIS movement segment.
+
+    For this short-range investigation use case,
+    an equirectangular projection is sufficient.
+    """
+
+    mean_lat = math.radians(
+        (
+            point_lat
+            + start_lat
+            + end_lat
+        ) / 3.0
+    )
+
+    scale_x = (
+        111.0
+        * math.cos(mean_lat)
+    )
+
+    scale_y = 111.0
+
+    px = (
+        point_lon
+        * scale_x
+    )
+
+    py = (
+        point_lat
+        * scale_y
+    )
+
+    ax = (
+        start_lon
+        * scale_x
+    )
+
+    ay = (
+        start_lat
+        * scale_y
+    )
+
+    bx = (
+        end_lon
+        * scale_x
+    )
+
+    by = (
+        end_lat
+        * scale_y
+    )
+
+    dx = bx - ax
+    dy = by - ay
+
+    segment_length_squared = (
+        dx * dx
+        + dy * dy
+    )
+
+    if segment_length_squared == 0:
+
+        return math.sqrt(
+            (px - ax) ** 2
+            + (py - ay) ** 2
+        )
+
+    t = (
+        (px - ax) * dx
+        + (py - ay) * dy
+    ) / segment_length_squared
+
+    t = max(
+        0.0,
+        min(
+            1.0,
+            t,
+        )
+    )
+
+    closest_x = (
+        ax
+        + t * dx
+    )
+
+    closest_y = (
+        ay
+        + t * dy
+    )
+
+    return math.sqrt(
+        (px - closest_x) ** 2
+        + (py - closest_y) ** 2
     )
 
 
@@ -110,24 +229,50 @@ def analyze_vessel_timeline(
     Analyze timestamped AIS history for one vessel.
 
     Detects:
-        - last known position
-        - next known position
-        - AIS gaps
-        - distance from source
-        - whether the source falls inside the
-          temporal movement corridor
+
+        - last known AIS position
+        - next known AIS position
+        - AIS gap duration
+        - distance from source to AIS observations
+        - distance from source to the historical
+          movement segment
+        - whether the historical movement corridor
+          is compatible with the detected source
+
+    Historical trajectory compatibility requires:
+
+        1. A genuine AIS gap exists.
+        2. Both AIS observations surrounding the
+           observation time exist.
+        3. The source is close to the movement segment.
+
+    This is investigation evidence, not proof of
+    vessel responsibility.
     """
 
     observation_time = pd.Timestamp(
-        observation_time,
-        tz="UTC",
+        observation_time
     )
+
+    if observation_time.tzinfo is None:
+        observation_time = (
+            observation_time.tz_localize(
+                "UTC"
+            )
+        )
+    else:
+        observation_time = (
+            observation_time.tz_convert(
+                "UTC"
+            )
+        )
 
     vessel_history = history[
         history["mmsi"] == str(mmsi)
     ].copy()
 
     if vessel_history.empty:
+
         return {
             "history_available": False,
             "ais_gap_hours": None,
@@ -138,6 +283,10 @@ def analyze_vessel_timeline(
     vessel_history = vessel_history.sort_values(
         "timestamp"
     )
+
+    # ==================================================
+    # 1. OBSERVATIONS BEFORE / AFTER TARGET TIME
+    # ==================================================
 
     before = vessel_history[
         vessel_history["timestamp"]
@@ -159,11 +308,12 @@ def analyze_vessel_timeline(
     else:
         after_point = after.iloc[0]
 
-    # ------------------------------------------
-    # No surrounding observations
-    # ------------------------------------------
+    # ==================================================
+    # 2. NO PREVIOUS AIS OBSERVATION
+    # ==================================================
 
     if before_point is None:
+
         return {
             "history_available": True,
             "ais_gap_hours": None,
@@ -174,8 +324,12 @@ def analyze_vessel_timeline(
         }
 
     last_position = {
-        "latitude": float(before_point["lat"]),
-        "longitude": float(before_point["lon"]),
+        "latitude": float(
+            before_point["lat"]
+        ),
+        "longitude": float(
+            before_point["lon"]
+        ),
         "timestamp": before_point[
             "timestamp"
         ].isoformat(),
@@ -184,17 +338,22 @@ def analyze_vessel_timeline(
     next_position = None
 
     if after_point is not None:
+
         next_position = {
-            "latitude": float(after_point["lat"]),
-            "longitude": float(after_point["lon"]),
+            "latitude": float(
+                after_point["lat"]
+            ),
+            "longitude": float(
+                after_point["lon"]
+            ),
             "timestamp": after_point[
                 "timestamp"
             ].isoformat(),
         }
 
-    # ------------------------------------------
-    # AIS gap
-    # ------------------------------------------
+    # ==================================================
+    # 3. AIS GAP
+    # ==================================================
 
     if after_point is not None:
 
@@ -207,9 +366,9 @@ def analyze_vessel_timeline(
 
         gap_hours = 0.0
 
-    # ------------------------------------------
-    # Distance from source to last observation
-    # ------------------------------------------
+    # ==================================================
+    # 4. SOURCE DISTANCE FROM ENDPOINTS
+    # ==================================================
 
     distance_from_last = haversine_distance(
         float(before_point["lat"]),
@@ -217,10 +376,6 @@ def analyze_vessel_timeline(
         source_latitude,
         source_longitude,
     )
-
-    # ------------------------------------------
-    # Distance from source to next observation
-    # ------------------------------------------
 
     if after_point is not None:
 
@@ -235,23 +390,55 @@ def analyze_vessel_timeline(
 
         distance_from_next = None
 
-    # ------------------------------------------
-    # Trajectory compatibility
-    #
-    # If the source is reasonably close to either
-    # side of an AIS gap, flag it for investigation.
-    # ------------------------------------------
+    # ==================================================
+    # 5. HISTORICAL MOVEMENT CORRIDOR
+    # ==================================================
 
-    trajectory_compatible = (
-        gap_hours > 0
-        and (
-            distance_from_last <= 50
-            or (
-                distance_from_next is not None
-                and distance_from_next <= 50
+    trajectory_distance = None
+
+    if after_point is not None:
+
+        trajectory_distance = (
+            point_to_segment_distance(
+                point_lat=source_latitude,
+                point_lon=source_longitude,
+                start_lat=float(
+                    before_point["lat"]
+                ),
+                start_lon=float(
+                    before_point["lon"]
+                ),
+                end_lat=float(
+                    after_point["lat"]
+                ),
+                end_lon=float(
+                    after_point["lon"]
+                ),
             )
         )
+
+    # ==================================================
+    # 6. HISTORICAL TRAJECTORY COMPATIBILITY
+    #
+    # We require:
+    #
+    #   - an actual AIS gap
+    #   - observations on both sides of the target time
+    #   - source close to the movement segment
+    #
+    # 20 km is deliberately conservative.
+    # ==================================================
+
+    trajectory_compatible = (
+        after_point is not None
+        and gap_hours > 0
+        and trajectory_distance is not None
+        and trajectory_distance <= 20.0
     )
+
+    # ==================================================
+    # 7. RETURN
+    # ==================================================
 
     return {
         "history_available": True,
@@ -276,6 +463,15 @@ def analyze_vessel_timeline(
                 2,
             )
             if distance_from_next is not None
+            else None
+        ),
+
+        "trajectory_distance_km": (
+            round(
+                trajectory_distance,
+                2,
+            )
+            if trajectory_distance is not None
             else None
         ),
 
