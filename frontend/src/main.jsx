@@ -1,3 +1,5 @@
+
+const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { jsPDF } from "jspdf";
@@ -13,8 +15,6 @@ import {
 
 import "leaflet/dist/leaflet.css";
 import "./styles.css";
-
-const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 const DEFAULT_LAT = 18.75;
 const DEFAULT_LON = 72.65;
