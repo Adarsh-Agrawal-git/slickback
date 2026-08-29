@@ -14,8 +14,7 @@ import {
 import "leaflet/dist/leaflet.css";
 import "./styles.css";
 
-
-const API = "http://localhost:8000";
+const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 const DEFAULT_LAT = 18.75;
 const DEFAULT_LON = 72.65;

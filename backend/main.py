@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException
@@ -8,25 +9,45 @@ from pydantic import BaseModel, Field
 from pipeline import run_pipeline
 
 
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+
+
+# ============================================================
+# APP
+# ============================================================
+
 app = FastAPI(
     title="SlickBack API",
     version="1.0.0",
 )
 
 
+# ============================================================
+# CORS
+# ============================================================
+
+# "*" is intentional for the prototype deployment.
+# Once the final Vercel URL is known, this can be restricted.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# ============================================================
+# REQUEST MODEL
+# ============================================================
+
 class SpillRequest(BaseModel):
+
     spill_lat: float = Field(
         ...,
         ge=-90,
@@ -48,11 +69,16 @@ class SpillRequest(BaseModel):
     )
 
 
+# ============================================================
+# HEALTH / ROOT
+# ============================================================
+
 @app.get("/")
 def root():
     return {
         "name": "SlickBack",
         "status": "running",
+        "version": "1.0.0",
     }
 
 
@@ -63,25 +89,37 @@ def health():
     }
 
 
+# ============================================================
+# ANALYZE SPILL
+# ============================================================
+
 @app.post("/analyze-spill")
 def analyze_spill(
     request: SpillRequest,
 ):
 
+    # --------------------------------------------------------
+    # DATA PATHS
+    # --------------------------------------------------------
+
     vessel_data_path = os.getenv(
         "VESSEL_DATA_PATH",
-        "data/vessels.csv",
+        str(DATA_DIR / "vessels.csv"),
     )
 
     ais_history_path = os.getenv(
         "AIS_HISTORY_PATH",
-        "data/ais_history.csv",
+        str(DATA_DIR / "ais_history.csv"),
     )
 
     image_output_path = os.getenv(
         "SENTINEL1_OUTPUT_PATH",
-        "data/sentinel1_vv.tif",
+        str(DATA_DIR / "sentinel1_vv.tif"),
     )
+
+    # --------------------------------------------------------
+    # CONFIGURATION
+    # --------------------------------------------------------
 
     bbox_delta = float(
         os.getenv(
@@ -111,6 +149,10 @@ def analyze_spill(
         )
     )
 
+    # --------------------------------------------------------
+    # TIME WINDOW
+    # --------------------------------------------------------
+
     start_datetime = (
         request.observation_time
         - timedelta(
@@ -118,9 +160,11 @@ def analyze_spill(
         )
     )
 
-    end_datetime = (
-        request.observation_time
-    )
+    end_datetime = request.observation_time
+
+    # --------------------------------------------------------
+    # PIPELINE
+    # --------------------------------------------------------
 
     try:
 

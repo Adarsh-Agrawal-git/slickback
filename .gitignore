@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 data/*.tif
 data/*.png
+frontend/node_modules/
