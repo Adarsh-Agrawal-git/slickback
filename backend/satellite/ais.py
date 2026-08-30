@@ -21,16 +21,13 @@ def load_vessels(path):
     vessels = pd.read_csv(path)
 
     required_columns = {
-        "mmsi",
-        "name",
-        "lat",
-        "lon",
-        "speed_knots",
-        "heading",
-        "ais_reliability",
-        "ais_gap_hours",
-        "sar_support",
-    }
+    "mmsi",
+    "name",
+    "lat",
+    "lon",
+    "speed_knots",
+    "heading",
+}
 
     missing_columns = required_columns - set(vessels.columns)
 
@@ -41,6 +38,15 @@ def load_vessels(path):
         )
 
     vessels = vessels.copy()
+    default_columns = {
+    "ais_reliability": 1.0,
+    "ais_gap_hours": 0.0,
+    "sar_support": 0.0,
+    }
+
+    for column, default_value in default_columns.items():
+        if column not in vessels.columns:
+           vessels[column] = default_value
 
     numeric_columns = [
         "lat",
