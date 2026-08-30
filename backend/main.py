@@ -2,6 +2,25 @@ import os
 from pathlib import Path
 from datetime import datetime, timedelta
 
+from dotenv import load_dotenv
+
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+
+# ============================================================
+# LOAD ENVIRONMENT VARIABLES
+# ============================================================
+
+load_dotenv(BASE_DIR / ".env")
+
+# ============================================================
+# IMPORT APPLICATION MODULES
+# ============================================================
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -11,11 +30,8 @@ from satellite.ais_live import refresh_live_ais
 
 
 # ============================================================
-# PATHS
+# DATA DIRECTORY
 # ============================================================
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
 
 DATA_DIR.mkdir(
     parents=True,
@@ -202,17 +218,6 @@ def analyze_spill(
         )
 
     except Exception as error:
-
-        # ----------------------------------------------------
-        # LIVE AIS IS OPTIONAL
-        # ----------------------------------------------------
-        #
-        # A failure in AISStream must NEVER stop the main
-        # SlickBack investigation pipeline.
-        #
-        # Historical AIS and the rest of the pipeline can
-        # continue independently.
-        # ----------------------------------------------------
 
         error_text = str(error)
 

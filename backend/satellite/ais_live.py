@@ -1,28 +1,67 @@
-import asyncio
-import json
+import csv
 import os
+from pathlib import Path
 from datetime import datetime, timezone
 
-import websockets
+import requests
 
 
-AISSTREAM_URL = "wss://stream.aisstream.io/v0/stream"
+# ============================================================
+# CONFIG
+# ============================================================
+
+OPENWATERS_URL = (
+    "https://ais.openwaters.io/v1/vessels"
+)
 
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def _get_api_key():
-    api_key = os.getenv("AISSTREAM_API_KEY")
+def _utc_now():
+    return datetime.now(timezone.utc)
 
-    if not api_key:
-        raise RuntimeError(
-            "AISSTREAM_API_KEY is not set."
+
+def _parse_timestamp(value):
+    if not value:
+        return _utc_now().isoformat()
+
+    try:
+        dt = datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
         )
 
-    return api_key
+        if dt.tzinfo is None:
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
 
+        return dt.astimezone(
+            timezone.utc
+        ).isoformat()
+
+    except Exception:
+        return _utc_now().isoformat()
+
+
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# ============================================================
+# BOUNDING BOX
+# ============================================================
 
 def _build_bbox(
     latitude,
@@ -30,595 +69,436 @@ def _build_bbox(
     radius_km,
 ):
     """
-    Approximate geographic bounding box around a center point.
+    Build a geographic bounding box around
+    the requested coordinate.
+
+    Returns:
+        [[[south, west], [north, east]]]
     """
+
+    latitude = float(latitude)
+    longitude = float(longitude)
+    radius_km = float(radius_km)
 
     lat_delta = radius_km / 111.0
 
-    lon_scale = max(
+    longitude_scale = max(
+        0.1,
         abs(__import__("math").cos(
-            __import__("math").radians(latitude)
-        )),
-        0.2,
+            __import__("math").radians(
+                latitude
+            )
+        ))
     )
 
     lon_delta = (
         radius_km
-        / (111.0 * lon_scale)
+        / (
+            111.0
+            * longitude_scale
+        )
+    )
+
+    south = max(
+        -90.0,
+        latitude - lat_delta
+    )
+
+    north = min(
+        90.0,
+        latitude + lat_delta
+    )
+
+    west = max(
+        -180.0,
+        longitude - lon_delta
+    )
+
+    east = min(
+        180.0,
+        longitude + lon_delta
     )
 
     return [
         [
-            latitude - lat_delta,
-            longitude - lon_delta,
+            south,
+            west,
         ],
         [
-            latitude + lat_delta,
-            longitude + lon_delta,
+            north,
+            east,
         ],
     ]
 
 
-def _decode_message(raw_message):
-    """
-    AISStream sends binary WebSocket frames containing UTF-8 JSON.
-    """
-
-    if isinstance(raw_message, bytes):
-        raw_message = raw_message.decode(
-            "utf-8",
-            errors="replace",
-        )
-
-    return json.loads(raw_message)
-
-
-def _extract_position(event):
-    """
-    Extract a normalized vessel observation from supported
-    AIS position message types.
-
-    Returns None when the event is not a usable position report.
-    """
-
-    message_type = event.get(
-        "MessageType"
-    )
-
-    metadata = event.get(
-        "MetaData",
-        {},
-    )
-
-    message = event.get(
-        "Message",
-        {},
-    )
-
-    position = None
-
-    if message_type == "PositionReport":
-        position = message.get(
-            "PositionReport"
-        )
-
-    elif message_type == "StandardClassBPositionReport":
-        position = message.get(
-            "StandardClassBPositionReport"
-        )
-
-    elif message_type == "ExtendedClassBPositionReport":
-        position = message.get(
-            "ExtendedClassBPositionReport"
-        )
-
-    if not isinstance(position, dict):
-        return None
-
-    # --------------------------------------------------------
-    # MMSI
-    # --------------------------------------------------------
-
-    mmsi = (
-        metadata.get("MMSI")
-        or position.get("UserID")
-    )
-
-    if mmsi is None:
-        return None
-
-    # --------------------------------------------------------
-    # LAT / LON
-    # --------------------------------------------------------
-
-    latitude = (
-        metadata.get("Latitude")
-        if metadata.get("Latitude") is not None
-        else position.get("Latitude")
-    )
-
-    longitude = (
-        metadata.get("Longitude")
-        if metadata.get("Longitude") is not None
-        else position.get("Longitude")
-    )
-
-    if latitude is None or longitude is None:
-        return None
-
-    try:
-        latitude = float(latitude)
-        longitude = float(longitude)
-    except (
-        TypeError,
-        ValueError,
-    ):
-        return None
-
-    if not (
-        -90.0 <= latitude <= 90.0
-        and -180.0 <= longitude <= 180.0
-    ):
-        return None
-
-    # --------------------------------------------------------
-    # SPEED
-    # --------------------------------------------------------
-
-    speed_knots = position.get(
-        "Sog"
-    )
-
-    if speed_knots is None:
-        speed_knots = 0.0
-
-    try:
-        speed_knots = float(
-            speed_knots
-        )
-    except (
-        TypeError,
-        ValueError,
-    ):
-        speed_knots = 0.0
-
-    # --------------------------------------------------------
-    # COURSE
-    # --------------------------------------------------------
-
-    heading = position.get(
-        "TrueHeading"
-    )
-
-    if heading is None:
-        heading = position.get(
-            "Cog"
-        )
-
-    if heading is None:
-        heading = 0.0
-
-    try:
-        heading = float(
-            heading
-        )
-    except (
-        TypeError,
-        ValueError,
-    ):
-        heading = 0.0
-
-    # --------------------------------------------------------
-    # SHIP NAME
-    # --------------------------------------------------------
-
-    ship_name = (
-        metadata.get("ShipName")
-        or "UNKNOWN"
-    )
-
-    if isinstance(
-        ship_name,
-        str,
-    ):
-        ship_name = ship_name.strip()
-
-    # --------------------------------------------------------
-    # AIS TIMESTAMP
-    # --------------------------------------------------------
-
-    timestamp = position.get(
-        "Timestamp"
-    )
-
-    if timestamp is not None:
-
-        try:
-            timestamp = int(
-                timestamp
-            )
-        except (
-            TypeError,
-            ValueError,
-        ):
-            timestamp = None
-
-    # --------------------------------------------------------
-    # NORMALIZED RESULT
-    # --------------------------------------------------------
-
-    return {
-        "mmsi": str(mmsi),
-        "name": ship_name,
-        "lat": latitude,
-        "lon": longitude,
-        "speed_knots": speed_knots,
-        "heading": heading,
-        "message_type": message_type,
-        "ais_timestamp": timestamp,
-        "received_at": datetime.now(
-            timezone.utc
-        ).isoformat(),
-    }
-
-
 # ============================================================
-# ASYNC COLLECTOR
+# FETCH LIVE AIS
 # ============================================================
 
-async def _collect_live_ais(
+def fetch_live_vessels(
     latitude,
     longitude,
-    radius_km,
-    duration_seconds,
+    radius_km=50,
+    timeout_seconds=30,
 ):
-    api_key = _get_api_key()
+    """
+    Fetch currently visible AIS vessels from
+    the Open Waters AIS endpoint.
+
+    The provider returns GeoJSON features.
+    """
 
     bbox = _build_bbox(
-        latitude=latitude,
-        longitude=longitude,
-        radius_km=radius_km,
-    )
-
-    print("\n")
-    print("=" * 60)
-    print("LIVE AIS STREAM")
-    print("=" * 60)
-
-    print(
-        "Center:",
         latitude,
         longitude,
+        radius_km,
     )
 
+    south = bbox[0][0]
+    west = bbox[0][1]
+    north = bbox[1][0]
+    east = bbox[1][1]
+
+    bbox_parameter = (
+        f"{south},{west},{north},{east}"
+    )
+
+    print()
     print(
-        "Radius:",
-        radius_km,
-        "km",
+        "LIVE AIS PROVIDER: OPEN WATERS"
     )
 
     print(
         "Bounding box:",
-        bbox,
+        bbox_parameter,
     )
-
-    print(
-        "Duration:",
-        duration_seconds,
-        "seconds",
-    )
-
-    print(
-        "AISStream URL:",
-        AISSTREAM_URL,
-    )
-
-    print("=" * 60)
-
-    subscription = {
-    "APIKey": api_key,
-    "BoundingBoxes": [
-        bbox
-    ],
-   }
-    vessels = {}
 
     try:
 
-        print(
-            "Connecting to AISStream..."
+        response = requests.get(
+            OPENWATERS_URL,
+            params={
+                "bbox": bbox_parameter,
+            },
+            timeout=timeout_seconds,
         )
 
-        # Enable permessage-deflate as recommended by AISStream.
-        async with websockets.connect(
-            AISSTREAM_URL,
-            compression="deflate",
-            ping_interval=20,
-            ping_timeout=20,
-            close_timeout=5,
-            max_size=4 * 1024 * 1024,
-        ) as websocket:
+        response.raise_for_status()
 
-            print(
-                "AISStream WebSocket connected."
-            )
-
-            await websocket.send(
-                json.dumps(
-                    subscription
-                )
-            )
-
-            print(
-                "AIS subscription sent."
-            )
-
-            start_time = (
-                asyncio.get_running_loop()
-                .time()
-            )
-
-            while True:
-
-                elapsed = (
-                    asyncio.get_running_loop()
-                    .time()
-                    - start_time
-                )
-
-                if elapsed >= duration_seconds:
-                    print(
-                        "AIS collection duration reached."
-                    )
-                    break
-
-                remaining = max(
-                    1.0,
-                    duration_seconds - elapsed,
-                )
-
-                try:
-
-                    raw_message = await asyncio.wait_for(
-                        websocket.recv(),
-                        timeout=min(
-                            10.0,
-                            remaining,
-                        ),
-                    )
-
-                except asyncio.TimeoutError:
-
-                    print(
-                        "AIS receive timeout; "
-                        "connection still open."
-                    )
-
-                    continue
-
-                except websockets.ConnectionClosed as error:
-
-                    print(
-                        "AISStream connection closed:"
-                    )
-
-                    print(
-                        "  code:",
-                        error.code,
-                    )
-
-                    print(
-                        "  reason:",
-                        error.reason,
-                    )
-
-                    break
-
-                except Exception as error:
-
-                    print(
-                        "AIS receive error:",
-                        repr(error),
-                    )
-
-                    break
-
-                # ------------------------------------------------
-                # DECODE
-                # ------------------------------------------------
-
-                try:
-
-                    event = _decode_message(
-                        raw_message
-                    )
-
-                except Exception as error:
-
-                    print(
-                        "AIS JSON decode error:",
-                        repr(error),
-                    )
-
-                    continue
-
-                message_type = event.get(
-                    "MessageType"
-                )
-
-                print(
-                    "AIS MESSAGE TYPE:",
-                    message_type,
-                )
-
-                # ------------------------------------------------
-                # SUBSCRIPTION CONFIRMATION
-                # ------------------------------------------------
-
-                if message_type == "SubscriptionConfirmation":
-
-                    confirmation = event.get(
-                        "Message",
-                        {},
-                    )
-
-                    print(
-                        "AIS subscription confirmed."
-                    )
-
-                    print(
-                        "Compression:",
-                        confirmation.get(
-                            "CompressionEnabled"
-                        ),
-                    )
-
-                    continue
-
-                # ------------------------------------------------
-                # POSITION MESSAGE
-                # ------------------------------------------------
-
-                vessel = _extract_position(
-                    event
-                )
-
-                if vessel is None:
-                    continue
-
-                mmsi = vessel["mmsi"]
-
-                vessels[mmsi] = vessel
-
-                print(
-                    "AIS VESSEL:",
-                    vessel["mmsi"],
-                    vessel["name"],
-                    vessel["lat"],
-                    vessel["lon"],
-                    vessel["speed_knots"],
-                    "knots",
-                )
+        payload = response.json()
 
     except Exception as error:
 
-        print(
-            "\n========== AIS STREAM ERROR =========="
+        raise RuntimeError(
+            "Open Waters AIS request failed: "
+            + str(error)
         )
 
-        print(
-            repr(error)
+    features = payload.get(
+        "features",
+        []
+    )
+
+    vessels = []
+
+    for feature in features:
+
+        if not isinstance(
+            feature,
+            dict
+        ):
+            continue
+
+        geometry = feature.get(
+            "geometry",
+            {}
         )
 
-        print(
-            "======================================"
+        properties = feature.get(
+            "properties",
+            {}
         )
 
-    print("\n")
+        if not isinstance(
+            geometry,
+            dict
+        ):
+            continue
+
+        if not isinstance(
+            properties,
+            dict
+        ):
+            continue
+
+        coordinates = geometry.get(
+            "coordinates",
+            []
+        )
+
+        if (
+            not isinstance(
+                coordinates,
+                list
+            )
+            or len(coordinates) < 2
+        ):
+            continue
+
+        longitude_value = _safe_float(
+            coordinates[0],
+            None,
+        )
+
+        latitude_value = _safe_float(
+            coordinates[1],
+            None,
+        )
+
+        if (
+            latitude_value is None
+            or longitude_value is None
+        ):
+            continue
+
+        mmsi = properties.get(
+            "mmsi",
+            feature.get("id"),
+        )
+
+        if mmsi is None:
+            continue
+
+        mmsi = str(mmsi)
+
+        speed_knots = _safe_float(
+            properties.get(
+                "sog",
+                0,
+            )
+        )
+
+        heading = _safe_float(
+            properties.get(
+                "heading",
+                properties.get(
+                    "cog",
+                    0,
+                ),
+            )
+        )
+
+        timestamp = _parse_timestamp(
+            properties.get(
+                "seen"
+            )
+        )
+
+        name = (
+            properties.get(
+                "name"
+            )
+            or properties.get(
+                "ship_name"
+            )
+            or mmsi
+        )
+
+        vessels.append({
+
+            "mmsi": mmsi,
+
+            "name": str(
+                name
+            ),
+
+            "lat": latitude_value,
+
+            "lon": longitude_value,
+
+            "speed_knots": speed_knots,
+
+            "heading": heading,
+
+            "message_type": str(
+                properties.get(
+                    "msg_type",
+                    "PositionReport",
+                )
+            ),
+
+            "ais_timestamp": timestamp,
+
+            "received_at": _utc_now().isoformat(),
+
+            # Derived fields expected by
+            # the SlickBack correlation layer.
+            "ais_reliability": 1.0,
+
+            "ais_gap_hours": 0.0,
+
+            "sar_support": 0.0,
+        })
+
+    # Remove duplicate MMSIs.
+    unique = {}
+
+    for vessel in vessels:
+
+        unique[
+            vessel["mmsi"]
+        ] = vessel
+
+    vessels = list(
+        unique.values()
+    )
+
     print(
         "Live vessels received:",
         len(vessels),
     )
 
-    print(
-        "=" * 60
+    return vessels
+
+
+# ============================================================
+# WRITE VESSEL CSV
+# ============================================================
+
+def save_vessels(
+    vessels,
+    path,
+):
+    """
+    Save normalized live AIS data in the format
+    expected by the SlickBack AIS analysis layer.
+    """
+
+    path = Path(path)
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    return list(
-        vessels.values()
+    fieldnames = [
+        "mmsi",
+        "name",
+        "lat",
+        "lon",
+        "speed_knots",
+        "heading",
+        "message_type",
+        "ais_timestamp",
+        "received_at",
+        "ais_reliability",
+        "ais_gap_hours",
+        "sar_support",
+    ]
+
+    with path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fieldnames,
+        )
+
+        writer.writeheader()
+
+        for vessel in vessels:
+
+            writer.writerow({
+                field: vessel.get(
+                    field,
+                    "",
+                )
+                for field in fieldnames
+            })
+
+    print(
+        "Live AIS saved:",
+        path,
     )
 
 
 # ============================================================
-# PUBLIC FUNCTION
+# MAIN REFRESH FUNCTION
 # ============================================================
 
 def refresh_live_ais(
     latitude,
     longitude,
     radius_km,
-    vessels_path=None,
+    vessels_path,
     history_path=None,
-    duration_seconds=60,
+    duration_seconds=30,
 ):
     """
-    Collect live AIS observations.
+    Refresh the current live AIS vessel dataset.
 
-    This function intentionally keeps the same public interface
-    used by main.py.
+    Open Waters provides a current vessel snapshot,
+    therefore duration_seconds is retained for API
+    compatibility but is not used as a streaming wait.
     """
 
-    vessels = asyncio.run(
-        _collect_live_ais(
-            latitude=latitude,
-            longitude=longitude,
-            radius_km=radius_km,
-            duration_seconds=duration_seconds,
-        )
-    )
-
-    # --------------------------------------------------------
-    # Optional persistence
-    # --------------------------------------------------------
-
-    if vessels_path:
-        try:
-            import csv
-
-            fieldnames = [
-                "mmsi",
-                "name",
-                "lat",
-                "lon",
-                "speed_knots",
-                "heading",
-                "message_type",
-                "ais_timestamp",
-                "received_at",
-            ]
-
-            with open(
-                vessels_path,
-                "w",
-                newline="",
-                encoding="utf-8",
-            ) as file:
-
-                writer = csv.DictWriter(
-                    file,
-                    fieldnames=fieldnames,
-                )
-
-                writer.writeheader()
-
-                for vessel in vessels:
-
-                    writer.writerow({
-                        field: vessel.get(
-                            field
-                        )
-                        for field in fieldnames
-                    })
-
-            print(
-                "Live AIS saved to:",
-                vessels_path,
-            )
-
-        except Exception as error:
-
-            print(
-                "WARNING: could not save "
-                "live AIS vessels:",
-                repr(error),
-            )
-
+    print()
     print(
-        "LIVE AIS REFRESH COMPLETE:"
+        "============================================================"
     )
 
     print(
-        vessels
+        "REFRESHING LIVE AIS"
     )
 
-    return vessels
+    print(
+        "============================================================"
+    )
+
+    vessels = fetch_live_vessels(
+        latitude=latitude,
+        longitude=longitude,
+        radius_km=radius_km,
+        timeout_seconds=30,
+    )
+
+    save_vessels(
+        vessels,
+        vessels_path,
+    )
+
+    return {
+
+        "enabled": True,
+
+        "available": True,
+
+        "status": (
+            "success"
+            if vessels
+            else "no_vessels"
+        ),
+
+        "provider": "Open Waters",
+
+        "vessels_received": len(
+            vessels
+        ),
+
+        "latitude": float(
+            latitude
+        ),
+
+        "longitude": float(
+            longitude
+        ),
+
+        "radius_km": float(
+            radius_km
+        ),
+
+        "vessels": vessels,
+    }
