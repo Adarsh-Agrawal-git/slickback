@@ -1,125 +1,470 @@
-from pathlib import Path
+"""
+Sentinel-2 optical cross-validation for SlickBack.
+
+Purpose:
+    Use Sentinel-2 optical imagery as supporting evidence for
+    Sentinel-1 SAR dark-region candidates.
+
+Important:
+    Sentinel-2 does NOT independently prove that a candidate is oil.
+    It provides optical support, weak support, or no usable evidence.
+
+Pipeline:
+
+    Sentinel-1 candidate
+          ↓
+    Sentinel-2 scene search
+          ↓
+    Cloud filtering
+          ↓
+    SCL cloud/shadow masking
+          ↓
+    Spectral indices
+          ↓
+    Local spectral comparison
+          ↓
+    Optical validation result
+"""
+
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+import math
+import os
 
 import ee
-from google.oauth2 import service_account
+import numpy as np
 
+from satellite.sentinel1 import initialize_earth_engine
 
 # ============================================================
-# EARTH ENGINE CONFIG
+# CONSTANTS
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_SEARCH_HOURS = 120
+DEFAULT_MAX_CLOUD_PERCENTAGE = 60.0
 
-PROJECT_ID = "slickback-507020"
-
-KEY_FILE = BASE_DIR / "slickback-earthengine.json"
-
-EE_SCOPE = [
-    "https://www.googleapis.com/auth/earthengine",
-    "https://www.googleapis.com/auth/cloud-platform",
-]
-
-_EE_INITIALIZED = False
+# Sentinel-2 bands used by the validation.
+BAND_BLUE = "B2"
+BAND_GREEN = "B3"
+BAND_RED = "B4"
+BAND_NIR = "B8"
+BAND_SWIR1 = "B11"
+BAND_SWIR2 = "B12"
+BAND_SCL = "SCL"
 
 
 # ============================================================
 # EARTH ENGINE INITIALIZATION
 # ============================================================
 
-def initialize_earth_engine():
+def _initialize_earth_engine():
+    """
+    Reuse the authenticated Earth Engine initialization
+    from sentinel1.py.
+    """
 
-    global _EE_INITIALIZED
-
-    if _EE_INITIALIZED:
-        return
-
-    if not KEY_FILE.exists():
-
-        raise FileNotFoundError(
-            f"Earth Engine service account key not found: {KEY_FILE}"
-        )
-
-    credentials = (
-        service_account.Credentials
-        .from_service_account_file(
-            str(KEY_FILE),
-            scopes=EE_SCOPE,
-        )
-    )
-
-    ee.Initialize(
-        credentials=credentials,
-        project=PROJECT_ID,
-    )
-
-    _EE_INITIALIZED = True
+    initialize_earth_engine()
 
     print(
-        "Sentinel-2 Earth Engine authentication: OK"
+        "Sentinel-2 Earth Engine session: OK"
     )
-
-
-# ============================================================
-# DATETIME
+#=========================================================
+# DATETIME HELPERS
 # ============================================================
 
-def _parse_datetime(value):
+def _ensure_utc(value):
+    """
+    Convert datetime/string input into timezone-aware UTC datetime.
+    """
 
-    if isinstance(
-        value,
-        datetime,
-    ):
+    if isinstance(value, datetime):
 
-        dt = value
+        result = value
+
+    elif isinstance(value, str):
+
+        text = value.strip()
+
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+
+        result = datetime.fromisoformat(
+            text
+        )
 
     else:
 
-        value = str(value)
-
-        if value.endswith("Z"):
-
-            value = (
-                value[:-1]
-                + "+00:00"
-            )
-
-        dt = datetime.fromisoformat(
-            value
+        raise TypeError(
+            "acquisition_time must be a datetime "
+            "or ISO datetime string."
         )
 
-    if dt.tzinfo is None:
+    if result.tzinfo is None:
 
-        dt = dt.replace(
+        result = result.replace(
             tzinfo=timezone.utc
         )
 
-    return dt
+    return result.astimezone(
+        timezone.utc
+    )
 
 
 # ============================================================
-# CLOUD / SHADOW MASK
+# GEOMETRY
 # ============================================================
 
-def _mask_clouds(image):
+def _candidate_geometry(
+    latitude,
+    longitude,
+    delta=0.025,
+):
     """
-    Mask Sentinel-2 pixels using the SCL band.
+    Create a small geometry around a candidate.
+    """
 
-    SCL classes removed:
+    latitude = float(latitude)
+    longitude = float(longitude)
+    delta = float(delta)
 
-        3  = cloud shadow
-        8  = medium probability cloud
-        9  = high probability cloud
-        10 = cirrus
-        11 = snow / ice
+    return ee.Geometry.Rectangle(
+        [
+            longitude - delta,
+            latitude - delta,
+            longitude + delta,
+            latitude + delta,
+        ]
+    )
+
+
+# ============================================================
+# SENTINEL-2 SCENE SEARCH
+# ============================================================
+
+def find_sentinel2_scene(
+    latitude,
+    longitude,
+    acquisition_time,
+    search_hours=DEFAULT_SEARCH_HOURS,
+    max_cloud_percentage=DEFAULT_MAX_CLOUD_PERCENTAGE,
+):
+    """
+    Find the best Sentinel-2 scene near the candidate.
+
+    Scene ranking considers:
+
+        1. cloud percentage
+        2. temporal distance
+
+    A highly cloudy scene is not allowed to dominate simply
+    because it is temporally closer.
+    """
+
+    _initialize_earth_engine()
+
+    acquisition_time = _ensure_utc(
+        acquisition_time
+    )
+
+    search_hours = float(
+        search_hours
+    )
+
+    start_time = (
+        acquisition_time
+        - timedelta(
+            hours=search_hours
+        )
+    )
+
+    end_time = (
+        acquisition_time
+        + timedelta(
+            hours=search_hours
+        )
+    )
+
+    geometry = _candidate_geometry(
+        latitude,
+        longitude,
+        delta=0.05,
+    )
+
+    start_millis = int(
+        start_time.timestamp() * 1000
+    )
+
+    target_millis = int(
+        acquisition_time.timestamp() * 1000
+    )
+
+    collection = (
+        ee.ImageCollection(
+            "COPERNICUS/S2_SR_HARMONIZED"
+        )
+        .filterBounds(
+            geometry
+        )
+        .filterDate(
+            start_time.isoformat(),
+            end_time.isoformat(),
+        )
+        .filter(
+            ee.Filter.lte(
+                "CLOUDY_PIXEL_PERCENTAGE",
+                float(
+                    max_cloud_percentage
+                ),
+            )
+        )
+    )
+
+    # --------------------------------------------------------
+    # Attach temporal distance.
+    # --------------------------------------------------------
+
+    def add_time_difference(image):
+
+        image_time = ee.Number(
+            image.get(
+                "system:time_start"
+            )
+        )
+
+        difference = (
+            image_time
+            .subtract(
+                target_millis
+            )
+            .abs()
+        )
+
+        return image.set(
+            "time_difference",
+            difference,
+        )
+
+    collection = collection.map(
+        add_time_difference
+    )
+
+    count = collection.size().getInfo()
+
+    print()
+    print(
+        "SENTINEL-2 SCENE SEARCH"
+    )
+
+    print(
+        "Search window:",
+        start_time.isoformat(),
+        "→",
+        end_time.isoformat(),
+    )
+
+    print(
+        "Maximum cloud percentage:",
+        max_cloud_percentage,
+    )
+
+    print(
+        "Sentinel-2 scenes found:",
+        count,
+    )
+
+    if count == 0:
+
+        return None
+
+    # --------------------------------------------------------
+    # Rank scenes using cloud + temporal distance.
+    #
+    # Cloud is deliberately weighted strongly.
+    # Temporal distance breaks ties between similarly clear
+    # scenes.
+    # --------------------------------------------------------
+
+    def add_scene_score(image):
+
+        cloud = ee.Number(
+            image.get(
+                "CLOUDY_PIXEL_PERCENTAGE"
+            )
+        )
+
+        time_difference_hours = (
+            ee.Number(
+                image.get(
+                    "time_difference"
+                )
+            )
+            .divide(
+                1000 * 60 * 60
+            )
+        )
+
+        scene_score = (
+            cloud.multiply(10)
+            .add(
+                time_difference_hours
+            )
+        )
+
+        return image.set(
+            "scene_score",
+            scene_score,
+        )
+
+    collection = collection.map(
+        add_scene_score
+    )
+
+    collection = collection.sort(
+        "scene_score"
+    )
+
+    image = ee.Image(
+        collection.first()
+    )
+
+    # --------------------------------------------------------
+    # Metadata.
+    # --------------------------------------------------------
+
+    scene_id = image.get(
+        "PRODUCT_ID"
+    ).getInfo()
+
+    if not scene_id:
+
+        scene_id = image.get(
+            "system:index"
+        ).getInfo()
+
+    acquisition_millis = image.get(
+        "system:time_start"
+    ).getInfo()
+
+    acquisition_datetime = (
+        datetime.fromtimestamp(
+            acquisition_millis / 1000,
+            tz=timezone.utc,
+        )
+    )
+
+    cloud_percentage = image.get(
+        "CLOUDY_PIXEL_PERCENTAGE"
+    ).getInfo()
+
+    scene_score = image.get(
+        "scene_score"
+    ).getInfo()
+
+    time_difference_hours = (
+        abs(
+            acquisition_millis
+            - target_millis
+        )
+        / 1000
+        / 60
+        / 60
+    )
+
+    print()
+    print(
+        "SELECTED SENTINEL-2 SCENE"
+    )
+
+    print(
+        "Scene:",
+        scene_id,
+    )
+
+    print(
+        "Acquisition:",
+        acquisition_datetime.isoformat(),
+    )
+
+    print(
+        "Cloud percentage:",
+        round(
+            float(
+                cloud_percentage
+            ),
+            3,
+        ),
+    )
+
+    print(
+        "Temporal difference:",
+        round(
+            time_difference_hours,
+            3,
+        ),
+        "hours",
+    )
+
+    print(
+        "Scene score:",
+        round(
+            float(
+                scene_score
+            ),
+            3,
+        ),
+    )
+
+    return {
+        "image": image,
+        "scene_id": scene_id,
+        "acquisition_time": (
+            acquisition_datetime
+        ),
+        "cloud_percentage": float(
+            cloud_percentage
+        ),
+        "temporal_difference_hours": float(
+            time_difference_hours
+        ),
+        "scene_score": float(
+            scene_score
+        ),
+        "search_start": start_time,
+        "search_end": end_time,
+    }
+
+
+# ============================================================
+# SCL CLOUD / SHADOW MASK
+# ============================================================
+
+def apply_scl_mask(image):
+    """
+    Mask Sentinel-2 pixels using the Scene Classification Layer.
+
+    Masked classes include:
+
+        0  No data
+        1  Saturated / defective
+        3  Cloud shadow
+        8  Medium probability cloud
+        9  High probability cloud
+        10 Thin cirrus
+        11 Snow / ice
     """
 
     scl = image.select(
-        "SCL"
+        BAND_SCL
     )
 
-    mask = (
-        scl.neq(3)
+    valid = (
+        scl.neq(0)
+        .And(
+            scl.neq(1)
+        )
+        .And(
+            scl.neq(3)
+        )
         .And(
             scl.neq(8)
         )
@@ -135,774 +480,681 @@ def _mask_clouds(image):
     )
 
     return image.updateMask(
-        mask
+        valid
     )
 
 
 # ============================================================
-# FIND SENTINEL-2 SCENE
+# SPECTRAL INDICES
 # ============================================================
 
-def find_sentinel2_scene(
-    latitude,
-    longitude,
-    acquisition_time,
-    search_hours=120,
-    max_cloud_percentage=100,
-):
+def add_spectral_indices(image):
     """
-    Find the closest Sentinel-2 SR scene.
+    Add optical indices used for candidate validation.
 
-    Searches a broad temporal window around the
-    Sentinel-1 acquisition.
+    NDVI:
+        vegetation indicator
 
-    Scene-level cloud percentage is used for ranking,
-    while local SCL masking is applied later.
+    NDWI:
+        water-related indicator
+
+    MNDWI:
+        water / surface discrimination
+
+    NDSI:
+        snow / ice indicator
     """
 
-    initialize_earth_engine()
-
-    point = ee.Geometry.Point(
+    ndvi = image.normalizedDifference(
         [
-            longitude,
-            latitude,
+            BAND_NIR,
+            BAND_RED,
+        ]
+    ).rename(
+        "NDVI"
+    )
+
+    ndwi = image.normalizedDifference(
+        [
+            BAND_GREEN,
+            BAND_NIR,
+        ]
+    ).rename(
+        "NDWI"
+    )
+
+    mndwi = image.normalizedDifference(
+        [
+            BAND_GREEN,
+            BAND_SWIR1,
+        ]
+    ).rename(
+        "MNDWI"
+    )
+
+    ndsi = image.normalizedDifference(
+        [
+            BAND_GREEN,
+            BAND_SWIR1,
+        ]
+    ).rename(
+        "NDSI"
+    )
+
+    return image.addBands(
+        [
+            ndvi,
+            ndwi,
+            mndwi,
+            ndsi,
         ]
     )
 
-    acquisition = _parse_datetime(
-        acquisition_time
-    )
 
-    start = (
-        acquisition
-        - timedelta(
-            hours=search_hours
+# ============================================================
+# LOCAL STATISTICS
+# ============================================================
+
+def _get_region_statistics(
+    image,
+    geometry,
+    scale=20,
+):
+    """
+    Extract local spectral statistics.
+    """
+
+    bands = [
+        BAND_BLUE,
+        BAND_GREEN,
+        BAND_RED,
+        BAND_NIR,
+        BAND_SWIR1,
+        BAND_SWIR2,
+        "NDVI",
+        "NDWI",
+        "MNDWI",
+        "NDSI",
+    ]
+
+    reducer = (
+        ee.Reducer.mean()
+        .combine(
+            reducer2=ee.Reducer.stdDev(),
+            sharedInputs=True,
+        )
+        .combine(
+            reducer2=ee.Reducer.minMax(),
+            sharedInputs=True,
         )
     )
 
-    end = (
-        acquisition
-        + timedelta(
-            hours=search_hours
-        )
+    result = image.select(
+        bands
+    ).reduceRegion(
+        reducer=reducer,
+        geometry=geometry,
+        scale=scale,
+        bestEffort=True,
+        maxPixels=100000,
     )
 
-    print()
-    print(
-        "SENTINEL-2 SEARCH"
+    return result.getInfo()
+
+
+def _safe_float(
+    value,
+    default=None,
+):
+    """
+    Convert a value safely to float.
+    """
+
+    if value is None:
+        return default
+
+    try:
+
+        value = float(value)
+
+        if not math.isfinite(
+            value
+        ):
+            return default
+
+        return value
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return default
+
+
+# ============================================================
+# OPTICAL CANDIDATE ANALYSIS
+# ============================================================
+
+def analyze_optical_candidate(
+    image,
+    latitude,
+    longitude,
+    candidate_delta=0.01,
+):
+    """
+    Analyse the optical region around a SAR candidate.
+
+    The analysis is intentionally conservative.
+
+    Sentinel-2 evidence is treated as supporting evidence,
+    not as proof of an oil spill.
+    """
+
+    candidate_geometry = _candidate_geometry(
+        latitude,
+        longitude,
+        delta=candidate_delta,
     )
-
-    print(
-        "From:",
-        start.isoformat()
-    )
-
-    print(
-        "To:",
-        end.isoformat()
-    )
-
-    collection = (
-        ee.ImageCollection(
-            "COPERNICUS/S2_SR_HARMONIZED"
-        )
-        .filterBounds(
-            point
-        )
-        .filterDate(
-            start.isoformat(),
-            end.isoformat(),
-        )
-        .filter(
-            ee.Filter.lte(
-                "CLOUDY_PIXEL_PERCENTAGE",
-                max_cloud_percentage,
-            )
-        )
-    )
-
-    count = collection.size().getInfo()
-
-    print(
-        "Sentinel-2 scenes found:",
-        count,
-    )
-
-    if count == 0:
-
-        return None
 
     # --------------------------------------------------------
-    # Calculate temporal distance.
+    # Mask and indices.
     # --------------------------------------------------------
 
-    acquisition_ms = (
-        acquisition.timestamp()
-        * 1000
+    masked = apply_scl_mask(
+        image
     )
 
-    collection = collection.map(
-        lambda image:
-        image.set(
-            "time_difference",
-            ee.Number(
-                image.get(
-                    "system:time_start"
-                )
-            )
-            .subtract(
-                acquisition_ms
-            )
-            .abs(),
+    processed = add_spectral_indices(
+        masked
+    )
+
+    statistics = _get_region_statistics(
+        processed,
+        candidate_geometry,
+        scale=20,
+    )
+
+    if not statistics:
+
+        return {
+            "valid": False,
+            "confidence": 0.0,
+            "reason": (
+                "No valid Sentinel-2 pixels "
+                "were available for the candidate."
+            ),
+        }
+
+    # --------------------------------------------------------
+    # Extract means.
+    # --------------------------------------------------------
+
+    blue = _safe_float(
+        statistics.get(
+            "B2_mean"
+        )
+    )
+
+    green = _safe_float(
+        statistics.get(
+            "B3_mean"
+        )
+    )
+
+    red = _safe_float(
+        statistics.get(
+            "B4_mean"
+        )
+    )
+
+    nir = _safe_float(
+        statistics.get(
+            "B8_mean"
+        )
+    )
+
+    swir1 = _safe_float(
+        statistics.get(
+            "B11_mean"
+        )
+    )
+
+    swir2 = _safe_float(
+        statistics.get(
+            "B12_mean"
+        )
+    )
+
+    ndvi = _safe_float(
+        statistics.get(
+            "NDVI_mean"
+        )
+    )
+
+    ndwi = _safe_float(
+        statistics.get(
+            "NDWI_mean"
+        )
+    )
+
+    mndwi = _safe_float(
+        statistics.get(
+            "MNDWI_mean"
+        )
+    )
+
+    ndsi = _safe_float(
+        statistics.get(
+            "NDSI_mean"
         )
     )
 
     # --------------------------------------------------------
-    # Sort by temporal distance.
+    # Validity check.
     # --------------------------------------------------------
 
-    collection = collection.sort(
-        "time_difference"
-    )
+    required_values = [
+        blue,
+        green,
+        red,
+        nir,
+        swir1,
+        swir2,
+    ]
 
-    image = ee.Image(
-        collection.first()
-    )
+    if any(
+        value is None
+        for value in required_values
+    ):
 
-    scene_id = image.get(
-        "PRODUCT_ID"
-    ).getInfo()
+        return {
+            "valid": False,
+            "confidence": 0.0,
+            "reason": (
+                "Insufficient valid optical "
+                "pixels after cloud masking."
+            ),
+            "statistics": statistics,
+        }
 
-    image_id = image.get(
-        "system:index"
-    ).getInfo()
+    # --------------------------------------------------------
+    # Conservative optical indicators.
+    #
+    # These are NOT an oil classifier.
+    # They only detect unusual low-reflectance /
+    # water-surface spectral behavior.
+    # --------------------------------------------------------
 
-    scene_time = (
-        ee.Date(
-            image.get(
-                "system:time_start"
-            )
+    indicators = []
+
+    score = 0.0
+
+    # Low NIR reflectance relative to surrounding water
+    # can support a surface anomaly, but is not specific
+    # to oil.
+    nir_scaled = nir / 10000.0
+
+    if nir_scaled < 0.08:
+
+        score += 15.0
+
+        indicators.append(
+            "low near-infrared reflectance"
         )
-        .format()
-        .getInfo()
+
+    # Low SWIR response can be consistent with a water-like
+    # surface and helps reject bright land/vegetation.
+    swir_scaled = swir1 / 10000.0
+
+    if swir_scaled < 0.10:
+
+        score += 10.0
+
+        indicators.append(
+            "low SWIR reflectance"
+        )
+
+    # Vegetation should not dominate a sea-surface candidate.
+    if ndvi is not None and ndvi < 0.20:
+
+        score += 10.0
+
+        indicators.append(
+            "low vegetation signal"
+        )
+
+    # Water-like spectral response.
+    if mndwi is not None and mndwi > 0:
+
+        score += 10.0
+
+        indicators.append(
+            "water-like spectral response"
+        )
+
+    # Penalize strong vegetation.
+    if ndvi is not None and ndvi > 0.45:
+
+        score -= 25.0
+
+        indicators.append(
+            "strong vegetation signal"
+        )
+
+    # Penalize snow/ice.
+    if ndsi is not None and ndsi > 0.4:
+
+        score -= 30.0
+
+        indicators.append(
+            "snow/ice-like spectral response"
+        )
+
+    # Clamp.
+    score = max(
+        0.0,
+        min(
+            score,
+            100.0,
+        ),
     )
 
-    cloud_percentage = image.get(
-        "CLOUDY_PIXEL_PERCENTAGE"
-    ).getInfo()
+    if score >= 50:
 
-    print(
-        "Selected Sentinel-2 scene:",
-        scene_id,
-    )
+        validation = "SUPPORTED"
 
-    print(
-        "Acquisition:",
-        scene_time,
-    )
+    elif score >= 25:
 
-    print(
-        "Cloud percentage:",
-        cloud_percentage,
-    )
+        validation = "WEAK_SUPPORT"
+
+    else:
+
+        validation = "NOT_SUPPORTED"
 
     return {
-        "image": image,
-
-        "scene_id": scene_id,
-
-        "image_id": image_id,
-
-        "acquisition_time": scene_time,
-
-        "cloud_percentage": (
-            float(
-                cloud_percentage
-            )
-            if cloud_percentage is not None
-            else None
+        "valid": True,
+        "validated": (
+            validation == "SUPPORTED"
         ),
+        "validation": validation,
+        "confidence": round(
+            score,
+            2,
+        ),
+        "indicators": indicators,
+        "statistics": {
+            "blue_mean": blue,
+            "green_mean": green,
+            "red_mean": red,
+            "nir_mean": nir,
+            "swir1_mean": swir1,
+            "swir2_mean": swir2,
+            "ndvi_mean": ndvi,
+            "ndwi_mean": ndwi,
+            "mndwi_mean": mndwi,
+            "ndsi_mean": ndsi,
+        },
     }
 
 
 # ============================================================
-# SENTINEL-2 CROSS VALIDATION
+# CANDIDATE VALIDATION
 # ============================================================
 
 def validate_sentinel2_candidate(
     latitude,
     longitude,
     acquisition_time,
-    search_hours=120,
+    search_hours=DEFAULT_SEARCH_HOURS,
 ):
     """
-    Cross-validate a Sentinel-1 candidate using
-    real Sentinel-2 surface-reflectance imagery.
+    Complete Sentinel-2 validation for one SAR candidate.
 
-    Sentinel-2 evidence is treated as supporting
-    evidence, not proof of oil.
+    Returns a stable result even when Sentinel-2 cannot provide
+    useful evidence.
     """
 
     print()
     print(
-        "=" * 60
+        "------------------------------------------------------------"
     )
 
     print(
-        "SENTINEL-2 CROSS VALIDATION"
-    )
-
-    print(
-        "=" * 60
+        "SENTINEL-2 CANDIDATE VALIDATION"
     )
 
     print(
         "Candidate:",
-        latitude,
-        longitude,
+        float(latitude),
+        float(longitude),
     )
 
     print(
-        "Reference time:",
-        acquisition_time,
+        "------------------------------------------------------------"
     )
 
-    scene = find_sentinel2_scene(
-        latitude=latitude,
-        longitude=longitude,
-        acquisition_time=acquisition_time,
-        search_hours=search_hours,
-    )
+    try:
 
-    if scene is None:
+        scene = find_sentinel2_scene(
+            latitude=latitude,
+            longitude=longitude,
+            acquisition_time=acquisition_time,
+            search_hours=search_hours,
+            max_cloud_percentage=60,
+        )
+
+    except Exception as error:
 
         print(
-            "No Sentinel-2 scene available."
+            "Sentinel-2 scene search failed:",
+            repr(error),
         )
 
         return {
             "available": False,
             "validated": False,
+            "validation": "UNAVAILABLE",
+            "confidence": 0.0,
+            "reason": str(error),
+        }
+
+    if scene is None:
+
+        print(
+            "No usable Sentinel-2 scene found."
+        )
+
+        return {
+            "available": False,
+            "validated": False,
+            "validation": "NO_SCENE",
             "confidence": 0.0,
             "reason": (
-                "No Sentinel-2 observation "
-                "available in the search window."
+                "No Sentinel-2 scene satisfied "
+                "the cloud and temporal search criteria."
             ),
         }
 
-    image = scene[
-        "image"
-    ]
-
-    # --------------------------------------------------------
-    # Apply SCL cloud/shadow mask.
-    # --------------------------------------------------------
-
-    masked = _mask_clouds(
-        image
-    )
-
-    point = ee.Geometry.Point(
-        [
-            longitude,
-            latitude,
-        ]
+    cloud_percentage = (
+        scene["cloud_percentage"]
     )
 
     # --------------------------------------------------------
-    # Candidate area.
-    # --------------------------------------------------------
-
-    candidate_region = point.buffer(
-        100
-    )
-
-    # --------------------------------------------------------
-    # Local reference area.
-    # --------------------------------------------------------
-
-    outer_region = point.buffer(
-        300
-    )
-
-    # --------------------------------------------------------
-    # Reflectance bands.
+    # Extra protection.
     #
-    # Scale factor for Sentinel-2 SR = 10000.
+    # Even though the collection filter already rejects scenes
+    # above 60%, keep this guard here so future changes to the
+    # search function cannot accidentally allow a highly cloudy
+    # scene into the validation stage.
     # --------------------------------------------------------
 
-    blue = (
-        masked
-        .select("B2")
-        .divide(10000)
-    )
+    if cloud_percentage > 60:
 
-    green = (
-        masked
-        .select("B3")
-        .divide(10000)
-    )
-
-    red = (
-        masked
-        .select("B4")
-        .divide(10000)
-    )
-
-    nir = (
-        masked
-        .select("B8")
-        .divide(10000)
-    )
-
-    # --------------------------------------------------------
-    # NDVI
-    # --------------------------------------------------------
-
-    ndvi = (
-        nir.subtract(red)
-        .divide(
-            nir.add(red).max(
-                0.0001
-            )
+        print(
+            "Sentinel-2 scene is too cloudy:",
+            cloud_percentage,
         )
-        .rename(
-            "NDVI"
-        )
-    )
-
-    # --------------------------------------------------------
-    # NDWI
-    # --------------------------------------------------------
-
-    ndwi = (
-        green.subtract(nir)
-        .divide(
-            green.add(nir).max(
-                0.0001
-            )
-        )
-        .rename(
-            "NDWI"
-        )
-    )
-
-    # --------------------------------------------------------
-    # Stack
-    # --------------------------------------------------------
-
-    optical = (
-        blue
-        .rename("BLUE")
-        .addBands(
-            green.rename("GREEN")
-        )
-        .addBands(
-            red.rename("RED")
-        )
-        .addBands(
-            nir.rename("NIR")
-        )
-        .addBands(
-            ndvi
-        )
-        .addBands(
-            ndwi
-        )
-    )
-
-    # --------------------------------------------------------
-    # Candidate statistics.
-    # --------------------------------------------------------
-
-    candidate_stats = (
-        optical
-        .reduceRegion(
-            reducer=ee.Reducer.median(),
-            geometry=candidate_region,
-            scale=10,
-            bestEffort=True,
-            maxPixels=100000,
-        )
-        .getInfo()
-    )
-
-    # --------------------------------------------------------
-    # Local reference statistics.
-    # --------------------------------------------------------
-
-    outer_stats = (
-        optical
-        .reduceRegion(
-            reducer=ee.Reducer.median(),
-            geometry=outer_region,
-            scale=10,
-            bestEffort=True,
-            maxPixels=100000,
-        )
-        .getInfo()
-    )
-
-    # --------------------------------------------------------
-    # No usable optical pixels.
-    # --------------------------------------------------------
-
-    if not candidate_stats:
 
         return {
             "available": True,
             "validated": False,
+            "validation": "CLOUD_OBSCURED",
             "confidence": 0.0,
-            "reason": (
-                "Sentinel-2 scene exists, but the "
-                "candidate area is masked or has "
-                "no usable optical pixels."
-            ),
-            "scene": {
-                "scene_id": scene[
-                    "scene_id"
-                ],
-                "acquisition_time": scene[
+            "cloud_percentage": cloud_percentage,
+            "scene_id": scene["scene_id"],
+            "acquisition_time": (
+                scene[
                     "acquisition_time"
-                ],
-                "cloud_percentage": scene[
-                    "cloud_percentage"
-                ],
-            },
+                ].isoformat()
+            ),
+            "reason": (
+                "Selected Sentinel-2 scene exceeds "
+                "the usable cloud threshold."
+            ),
         }
 
-    # ========================================================
-    # VALUE HELPER
-    # ========================================================
+    try:
 
-    def get_value(
-        dictionary,
-        key,
-    ):
-
-        value = dictionary.get(
-            key
+        optical = analyze_optical_candidate(
+            image=scene["image"],
+            latitude=latitude,
+            longitude=longitude,
         )
 
-        if value is None:
+    except Exception as error:
 
-            return None
-
-        return float(
-            value
+        print(
+            "Sentinel-2 optical analysis failed:",
+            repr(error),
         )
 
-    candidate_ndvi = get_value(
-        candidate_stats,
-        "NDVI",
-    )
-
-    candidate_ndwi = get_value(
-        candidate_stats,
-        "NDWI",
-    )
-
-    candidate_red = get_value(
-        candidate_stats,
-        "RED",
-    )
-
-    candidate_nir = get_value(
-        candidate_stats,
-        "NIR",
-    )
-
-    outer_ndvi = get_value(
-        outer_stats,
-        "NDVI",
-    )
-
-    outer_ndwi = get_value(
-        outer_stats,
-        "NDWI",
-    )
-
-    outer_red = get_value(
-        outer_stats,
-        "RED",
-    )
-
-    outer_nir = get_value(
-        outer_stats,
-        "NIR",
-    )
-
-    # ========================================================
-    # LOCAL DIFFERENCES
-    # ========================================================
-
-    ndvi_difference = None
-
-    if (
-        candidate_ndvi is not None
-        and outer_ndvi is not None
-    ):
-
-        ndvi_difference = (
-            candidate_ndvi
-            - outer_ndvi
-        )
-
-    ndwi_difference = None
-
-    if (
-        candidate_ndwi is not None
-        and outer_ndwi is not None
-    ):
-
-        ndwi_difference = (
-            candidate_ndwi
-            - outer_ndwi
-        )
-
-    red_difference = None
-
-    if (
-        candidate_red is not None
-        and outer_red is not None
-    ):
-
-        red_difference = (
-            candidate_red
-            - outer_red
-        )
-
-    nir_difference = None
-
-    if (
-        candidate_nir is not None
-        and outer_nir is not None
-    ):
-
-        nir_difference = (
-            candidate_nir
-            - outer_nir
-        )
-
-    # ========================================================
-    # EVIDENCE SCORING
-    # ========================================================
-
-    score = 0.0
-
-    indicators = []
-
-    # --------------------------------------------------------
-    # NDWI
-    # --------------------------------------------------------
-
-    if (
-        ndwi_difference is not None
-        and ndwi_difference < -0.03
-    ):
-
-        score += 0.25
-
-        indicators.append(
-            "LOCAL NDWI ANOMALY"
-        )
-
-    # --------------------------------------------------------
-    # NDVI
-    # --------------------------------------------------------
-
-    if (
-        ndvi_difference is not None
-        and ndvi_difference < -0.03
-    ):
-
-        score += 0.20
-
-        indicators.append(
-            "LOCAL NDVI ANOMALY"
-        )
-
-    # --------------------------------------------------------
-    # Red band
-    # --------------------------------------------------------
-
-    if (
-        red_difference is not None
-        and abs(red_difference) > 0.005
-    ):
-
-        score += 0.20
-
-        indicators.append(
-            "LOCAL RED-BAND ANOMALY"
-        )
-
-    # --------------------------------------------------------
-    # NIR band
-    # --------------------------------------------------------
-
-    if (
-        nir_difference is not None
-        and abs(nir_difference) > 0.005
-    ):
-
-        score += 0.20
-
-        indicators.append(
-            "LOCAL NIR-BAND ANOMALY"
-        )
-
-    # --------------------------------------------------------
-    # Cloud penalty.
-    # --------------------------------------------------------
-
-    cloud_percentage = (
-        scene[
-            "cloud_percentage"
-        ]
-    )
-
-    cloud_penalty = 0.0
-
-    if cloud_percentage is not None:
-
-        if cloud_percentage > 80:
-
-            cloud_penalty = 0.20
-
-        elif cloud_percentage > 60:
-
-            cloud_penalty = 0.10
-
-        elif cloud_percentage > 40:
-
-            cloud_penalty = 0.05
-
-    score = max(
-        0.0,
-        min(
-            1.0,
-            score - cloud_penalty,
-        ),
-    )
-
-    validated = (
-        score >= 0.35
-        and cloud_percentage is not None
-        and cloud_percentage < 80
-    )
-
-    # ========================================================
-    # RESULT
-    # ========================================================
+        return {
+            "available": True,
+            "validated": False,
+            "validation": "ANALYSIS_FAILED",
+            "confidence": 0.0,
+            "cloud_percentage": cloud_percentage,
+            "scene_id": scene["scene_id"],
+            "acquisition_time": (
+                scene[
+                    "acquisition_time"
+                ].isoformat()
+            ),
+            "reason": str(error),
+        }
 
     result = {
-
         "available": True,
-
         "validated": bool(
-            validated
+            optical.get(
+                "validated",
+                False,
+            )
         ),
-
-        "confidence": round(
-            score,
-            3,
+        "validation": optical.get(
+            "validation",
+            "NOT_SUPPORTED",
         ),
-
-        "indicators": indicators,
-
-        "scene": {
-
-            "scene_id": scene[
-                "scene_id"
-            ],
-
-            "image_id": scene[
-                "image_id"
-            ],
-
-            "acquisition_time": scene[
+        "confidence": float(
+            optical.get(
+                "confidence",
+                0.0,
+            )
+        ),
+        "cloud_percentage": float(
+            cloud_percentage
+        ),
+        "scene_id": scene[
+            "scene_id"
+        ],
+        "acquisition_time": (
+            scene[
                 "acquisition_time"
-            ],
-
-            "cloud_percentage": cloud_percentage,
-        },
-
-        "candidate": {
-
-            "ndvi": candidate_ndvi,
-
-            "ndwi": candidate_ndwi,
-
-            "red_reflectance": candidate_red,
-
-            "nir_reflectance": candidate_nir,
-        },
-
-        "local_reference": {
-
-            "ndvi": outer_ndvi,
-
-            "ndwi": outer_ndwi,
-
-            "red_reflectance": outer_red,
-
-            "nir_reflectance": outer_nir,
-        },
-
-        "differences": {
-
-            "ndvi": ndvi_difference,
-
-            "ndwi": ndwi_difference,
-
-            "red_reflectance": red_difference,
-
-            "nir_reflectance": nir_difference,
-        },
-
-        "interpretation": (
-            "Sentinel-2 provides supporting optical "
-            "evidence spatially associated with the "
-            "Sentinel-1 anomaly."
-            if validated
-            else
-            "Sentinel-2 does not provide strong "
-            "optical confirmation of the "
-            "Sentinel-1 anomaly."
+            ].isoformat()
+        ),
+        "temporal_difference_hours": float(
+            scene[
+                "temporal_difference_hours"
+            ]
+        ),
+        "indicators": optical.get(
+            "indicators",
+            [],
+        ),
+        "statistics": optical.get(
+            "statistics",
+            {},
         ),
     }
 
     print()
     print(
-        "Sentinel-2 scene:",
-        scene[
-            "scene_id"
-        ],
+        "SENTINEL-2 VALIDATION RESULT"
     )
 
     print(
-        "Cloud percentage:",
-        cloud_percentage,
+        "Scene:",
+        result["scene_id"],
+    )
+
+    print(
+        "Cloud:",
+        round(
+            result["cloud_percentage"],
+            2,
+        ),
+        "%",
+    )
+
+    print(
+        "Optical validation:",
+        result["validation"],
     )
 
     print(
         "Optical confidence:",
-        result[
-            "confidence"
-        ],
+        result["confidence"],
     )
 
-    print(
-        "Validated:",
-        result[
-            "validated"
-        ],
-    )
+    if result["indicators"]:
 
-    print(
-        "Indicators:",
-        indicators,
-    )
+        print(
+            "Indicators:"
+        )
+
+        for indicator in result[
+            "indicators"
+        ]:
+
+            print(
+                "  -",
+                indicator,
+            )
 
     return result
+
+
+# ============================================================
+# BACKWARD-COMPATIBILITY ALIAS
+# ============================================================
+
+validate_candidate = (
+    validate_sentinel2_candidate
+)
+
+
+# ============================================================
+# MODULE TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    print(
+        "Sentinel-2 validation module loaded."
+    )
+
+    print(
+        "Use validate_sentinel2_candidate() "
+        "from the SlickBack pipeline."
+    )

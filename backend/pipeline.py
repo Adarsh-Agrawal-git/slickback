@@ -1,6 +1,6 @@
 import numpy as np
 from datetime import datetime, timedelta
-
+from satellite.sentinel2 import validate_sentinel2_candidate
 from environment import fetch_environment
 from simulation import backward_particles
 
@@ -360,6 +360,55 @@ def run_pipeline(
             f"{candidate.get('latitude', 0):.5f}, "
             f"{candidate.get('longitude', 0):.5f} "
             f"score={candidate['sar_priority_score']:.2f}"
+        )
+            # ========================================================
+    # 9B. SENTINEL-2 CROSS VALIDATION
+    # ========================================================
+
+    print()
+    print("=" * 60)
+    print("SENTINEL-2 CROSS VALIDATION")
+    print("=" * 60)
+
+    for candidate_index, candidate in enumerate(
+        candidate_features,
+        start=1,
+    ):
+
+        print(
+            f"\nValidating candidate {candidate_index}/"
+            f"{len(candidate_features)} with Sentinel-2..."
+        )
+
+        try:
+
+            sentinel2_validation = (
+                validate_sentinel2_candidate(
+                    latitude=candidate["latitude"],
+                    longitude=candidate["longitude"],
+                    acquisition_time=(
+                        satellite_metadata["acquisition_time"]
+                    ),
+                    search_hours=120,
+                )
+            )
+
+        except Exception as error:
+
+            print(
+                "WARNING: Sentinel-2 validation failed:",
+                repr(error),
+            )
+
+            sentinel2_validation = {
+                "available": False,
+                "validated": False,
+                "confidence": 0.0,
+                "reason": str(error),
+            }
+
+        candidate["sentinel2_validation"] = (
+            sentinel2_validation
         )
 
     # ========================================================
