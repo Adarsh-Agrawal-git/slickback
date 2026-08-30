@@ -1,4 +1,3 @@
-import traceback
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -204,23 +203,47 @@ def analyze_spill(
 
     except Exception as error:
 
+        # ----------------------------------------------------
+        # LIVE AIS IS OPTIONAL
+        # ----------------------------------------------------
+        #
+        # A failure in AISStream must NEVER stop the main
+        # SlickBack investigation pipeline.
+        #
+        # Historical AIS and the rest of the pipeline can
+        # continue independently.
+        # ----------------------------------------------------
+
+        error_text = str(error)
+
+        if "AISSTREAM_API_KEY is not set" in error_text:
+
+            reason = (
+                "AISStream API key not configured"
+            )
+
+        else:
+
+            reason = error_text
+
         print(
-            "\n========== LIVE AIS ERROR =========="
+            "Live AIS unavailable:",
+            reason,
         )
-
-        traceback.print_exc()
-
-        print(
-            "====================================\n"
-        )
-
-        # Do NOT stop the entire pipeline if live AIS fails.
-        # The historical AIS data can still be used.
 
         ais_refresh_result = {
+
             "enabled": True,
-            "status": "failed",
-            "error": str(error),
+
+            "available": False,
+
+            "status": "unavailable",
+
+            "provider": "AISStream",
+
+            "reason": reason,
+
+            "vessels_received": 0,
         }
 
     # ========================================================
@@ -290,7 +313,9 @@ def analyze_spill(
             "\n========== PIPELINE ERROR =========="
         )
 
-        traceback.print_exc()
+        print(
+            str(error)
+        )
 
         print(
             "====================================\n"
