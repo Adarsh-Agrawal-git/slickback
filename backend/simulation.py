@@ -1,3 +1,4 @@
+from environment import fetch_environment
 from datetime import datetime, timedelta, timezone
 import math
 import numpy as np
@@ -38,36 +39,172 @@ def destination(lat, lon, bearing_deg, distance_km):
     return lat2, lon2
 
 
-def backward_particles(lat, lon, hours_back, n=400):
-    """Synthetic backward drift: wind/current field + uncertainty.
-    This is intentionally not OpenDrift yet; it gives us a working prototype loop.
+def backward_particles(
+    lat,
+    lon,
+    hours_back,
+    environment,
+    n=400,
+):
     """
+    Reconstruct possible spill-source locations by
+    propagating particles backward using environmental
+    wind and ocean-current conditions.
+
+    Current direction is treated as the direction
+    toward which the current flows.
+
+    Wind direction from Open-Meteo is meteorological
+    direction (direction the wind comes FROM), so it
+    is converted to the direction the wind travels TO.
+    """
+
     rng = np.random.default_rng(42)
-    # Approximate environmental drift for demo purposes.
-    current_speed_kmh = 1.2
-    current_bearing = 55.0
-    wind_speed_kmh = 7.0
-    wind_bearing = 40.0
+
+    current_speed_kmh = float(
+        environment["current_speed_kmh"]
+    )
+
+    current_bearing = float(
+        environment["current_bearing_deg"]
+    )
+
+    wind_speed_kmh = float(
+        environment["wind_speed_kmh"]
+    )
+
+    # Meteorological wind direction = FROM.
+    # Convert to direction of movement = TO.
+    wind_bearing = (
+        wind_bearing_from
+        if False
+        else (
+            float(
+                environment["wind_bearing_deg"]
+            )
+            + 180.0
+        ) % 360.0
+    )
 
     total_dx = 0.0
     total_dy = 0.0
+
     for _ in range(hours_back):
-        # Reverse the observed motion.
-        total_dx -= current_speed_kmh * math.sin(math.radians(current_bearing))
-        total_dy -= current_speed_kmh * math.cos(math.radians(current_bearing))
-        total_dx -= 0.025 * wind_speed_kmh * math.sin(math.radians(wind_bearing))
-        total_dy -= 0.025 * wind_speed_kmh * math.cos(math.radians(wind_bearing))
 
-    sigma = max(0.7, hours_back * 0.18)
-    dx = total_dx + rng.normal(0, sigma, n)
-    dy = total_dy + rng.normal(0, sigma, n)
+        # ----------------------------------------------------
+        # Ocean current contribution
+        # ----------------------------------------------------
 
-    lon_scale = max(math.cos(math.radians(lat)), 0.2)
-    lats = lat + dy / 111.0
-    lons = lon + dx / (111.0 * lon_scale)
+        current_dx = (
+            current_speed_kmh
+            * math.sin(
+                math.radians(
+                    current_bearing
+                )
+            )
+        )
+
+        current_dy = (
+            current_speed_kmh
+            * math.cos(
+                math.radians(
+                    current_bearing
+                )
+            )
+        )
+
+        # ----------------------------------------------------
+        # Wind contribution
+        #
+        # Keep the same 2.5% windage assumption used
+        # by the original prototype.
+        # ----------------------------------------------------
+
+        windage = 0.025
+
+        wind_dx = (
+            windage
+            * wind_speed_kmh
+            * math.sin(
+                math.radians(
+                    wind_bearing
+                )
+            )
+        )
+
+        wind_dy = (
+            windage
+            * wind_speed_kmh
+            * math.cos(
+                math.radians(
+                    wind_bearing
+                )
+            )
+        )
+
+        # ----------------------------------------------------
+        # Backward integration
+        # ----------------------------------------------------
+
+        total_dx -= (
+            current_dx
+            + wind_dx
+        )
+
+        total_dy -= (
+            current_dy
+            + wind_dy
+        )
+
+    # --------------------------------------------------------
+    # Environmental uncertainty
+    # --------------------------------------------------------
+
+    environmental_uncertainty = max(
+        0.7,
+        hours_back * 0.18
+    )
+
+    dx = (
+        total_dx
+        + rng.normal(
+            0,
+            environmental_uncertainty,
+            n,
+        )
+    )
+
+    dy = (
+        total_dy
+        + rng.normal(
+            0,
+            environmental_uncertainty,
+            n,
+        )
+    )
+
+    lon_scale = max(
+        math.cos(
+            math.radians(lat)
+        ),
+        0.2,
+    )
+
+    lats = (
+        lat
+        + dy / 111.0
+    )
+
+    lons = (
+        lon
+        + dx
+        / (
+            111.0
+            * lon_scale
+        )
+    )
 
     return lats, lons
-
 
 def score_vessel(vessel, source_lat, source_lon, observation_time, hours_back):
     # For the adversarial Stage-1 scenario, Alpha has a known historical AIS
@@ -130,29 +267,77 @@ def score_vessel(vessel, source_lat, source_lon, observation_time, hours_back):
     }
 
 
-def generate_spill_analysis(lat, lon, observation_time, hours_back):
-    lats, lons = backward_particles(lat, lon, hours_back)
-    source_lat = float(np.mean(lats))
-    source_lon = float(np.mean(lons))
+def generate_spill_analysis(
+    lat,
+    lon,
+    observation_time,
+    hours_back,
+):
+    environment = fetch_environment(
+        latitude=lat,
+        longitude=lon,
+        observation_time=observation_time,
+    )
 
-    # Ellipse-like source uncertainty derived from particle spread.
-    source_radius_km = float(max(np.std(lats), np.std(lons)) * 111.0 * 2.0)
+    lats, lons = backward_particles(
+        lat=lat,
+        lon=lon,
+        hours_back=hours_back,
+        environment=environment,
+    )
+
+    source_lat = float(
+        np.mean(lats)
+    )
+
+    source_lon = float(
+        np.mean(lons)
+    )
+
+    source_radius_km = float(
+        max(
+            np.std(lats),
+            np.std(lons),
+        )
+        * 111.0
+        * 2.0
+    )
 
     candidates = [
-        score_vessel(v, source_lat, source_lon, observation_time, hours_back)
+        score_vessel(
+            v,
+            source_lat,
+            source_lon,
+            observation_time,
+            hours_back,
+        )
         for v in VESSELS
     ]
-    candidates.sort(key=lambda x: x["overall_score"], reverse=True)
 
-    # Strip null flags.
-    for c in candidates:
-        c["flags"] = [f for f in c["flags"] if f]
+    candidates.sort(
+        key=lambda x: x["overall_score"],
+        reverse=True,
+    )
 
-    source_time = observation_time - timedelta(hours=hours_back)
+    for candidate in candidates:
+        candidate["flags"] = [
+            flag
+            for flag in candidate["flags"]
+            if flag
+        ]
+
+    source_time = (
+        observation_time
+        - timedelta(
+            hours=hours_back
+        )
+    )
 
     return {
         "incident": {
-            "observed_at": observation_time.isoformat(),
+            "observed_at": (
+                observation_time.isoformat()
+            ),
             "hours_rewound": hours_back,
             "slick": {
                 "lat": lat,
@@ -161,21 +346,34 @@ def generate_spill_analysis(lat, lon, observation_time, hours_back):
                 "detection_confidence": 87.0,
             },
         },
+
         "source_reconstruction": {
-            "source_lat": round(source_lat, 5),
-            "source_lon": round(source_lon, 5),
-            "uncertainty_radius_km": round(source_radius_km, 2),
-            "release_window_start": source_time.isoformat(),
-            "release_window_end": (source_time + timedelta(hours=2)).isoformat(),
+            "source_lat": round(
+                source_lat,
+                5,
+            ),
+            "source_lon": round(
+                source_lon,
+                5,
+            ),
+            "uncertainty_radius_km": round(
+                source_radius_km,
+                2,
+            ),
+            "release_window_start": (
+                source_time.isoformat()
+            ),
+            "release_window_end": (
+                (
+                    source_time
+                    + timedelta(hours=2)
+                ).isoformat()
+            ),
             "particle_count": len(lats),
         },
-        "environment": {
-            "current_speed_kmh": 1.2,
-            "current_bearing_deg": 55,
-            "wind_speed_kmh": 7.0,
-            "wind_bearing_deg": 40,
-            "provider": "SYNTHETIC PROTOTYPE DATA",
-        },
+
+        "environment": environment,
+
         "lookalike_analysis": {
             "oil_probability": 77.0,
             "low_wind_probability": 12.0,
@@ -183,14 +381,26 @@ def generate_spill_analysis(lat, lon, observation_time, hours_back):
             "biogenic_probability": 7.0,
             "status": "PROBABLE OIL",
         },
-        "candidates": candidates,
-        "scenario": {
-            "name": "DRIFT-TIME-LAG ADVERSARIAL CASE",
-            "purpose": "Baseline is expected to favor the nearest current vessel, while SlickBack evaluates historical vessel positions against the reconstructed source.",
-        },
-        "disclaimer": "Prototype ranking is an investigation lead, not legal proof of responsibility.",
-    }
 
+        "candidates": candidates,
+
+        "scenario": {
+            "name": (
+                "ENVIRONMENTALLY DRIVEN "
+                "DRIFT-TIME-LAG ANALYSIS"
+            ),
+            "purpose": (
+                "Reconstruct the likely spill source "
+                "using historical AIS and modeled "
+                "environmental conditions."
+            ),
+        },
+
+        "disclaimer": (
+            "Prototype ranking is an investigation "
+            "lead, not legal proof of responsibility."
+        ),
+    }
 
 def baseline_distance_score(vessel, spill_lat, spill_lon):
     """Baseline attribution: rank vessels only by distance to observed slick.

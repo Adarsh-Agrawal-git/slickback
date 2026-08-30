@@ -5,3 +5,5 @@ __pycache__/
 data/*.tif
 data/*.png
 frontend/node_modules/
+backend/slickback-earthengine.json
+*.json

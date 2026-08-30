@@ -1,137 +1,240 @@
 import numpy as np
-import tifffile
-from scipy.ndimage import median_filter
+import rasterio
 
+
+# ============================================================
+# LOAD SENTINEL-1
+# ============================================================
 
 def load_sentinel1(path):
     """
-    Load scientific Sentinel-1 TIFF.
+    Load Sentinel-1 TIFF.
 
-    Supports both common layouts:
-        (height, width, bands)
-        (bands, height, width)
+    Supports:
+        2D: (height, width)
+        3D: (bands, height, width)
 
-    Band 0 = VV
-    Band 1 = data mask
+    Returns:
+        2D float32 VV image.
     """
 
-    data = tifffile.imread(path).astype(np.float32)
+    with rasterio.open(path) as src:
 
-    print("\n========== SENTINEL-1 TIFF ==========")
-    print("Shape:", data.shape)
-    print("Dtype:", data.dtype)
-    print("Min:", np.nanmin(data))
-    print("Max:", np.nanmax(data))
-    print("=====================================\n")
+        data = src.read()
 
-    if data.ndim != 3:
-        raise ValueError(
-            f"Expected 3D Sentinel-1 TIFF, got shape {data.shape}"
-        )
+    if data.ndim == 2:
 
-    # Case 1: (height, width, bands)
-    if data.shape[-1] == 2:
+        vv = data
 
-        vv = data[:, :, 0]
-        mask = data[:, :, 1]
+    elif data.ndim == 3:
 
-    # Case 2: (bands, height, width)
-    elif data.shape[0] == 2:
+        if data.shape[0] == 0:
 
-        vv = data[0, :, :]
-        mask = data[1, :, :]
+            raise ValueError(
+                "Sentinel-1 TIFF contains no bands."
+            )
+
+        vv = data[0]
 
     else:
+
         raise ValueError(
-            f"Could not identify VV/dataMask bands. "
-            f"Unexpected TIFF shape: {data.shape}"
+            f"Unexpected Sentinel-1 TIFF shape: {data.shape}"
         )
 
-    vv = vv.astype(np.float32)
-    mask = mask.astype(np.float32)
+    vv = np.asarray(
+        vv,
+        dtype=np.float32,
+    )
 
-    print("VV valid pixels before mask:",
-          np.count_nonzero(np.isfinite(vv)))
+    vv[~np.isfinite(vv)] = np.nan
 
-    print("Mask values:",
-          np.unique(mask)[:10])
+    if not np.any(
+        np.isfinite(vv)
+    ):
 
-    # Apply data mask
-    vv[mask <= 0] = np.nan
-
-    print("VV valid pixels after mask:",
-          np.count_nonzero(np.isfinite(vv)))
-
-    if not np.any(np.isfinite(vv)):
         raise ValueError(
-            "Sentinel-1 TIFF contains no valid VV pixels. "
-            "The problem is with the downloaded data/mask."
+            "Sentinel-1 TIFF contains no valid pixels."
         )
 
     return vv
 
 
+# ============================================================
+# CONVERT TO dB
+# ============================================================
+
 def to_db(vv):
     """
-    Convert Sentinel-1 linear backscatter to dB.
+    Convert Sentinel-1 VV data to dB.
+
+    The function automatically determines whether the
+    input appears to be linear backscatter or already-dB data.
+
+    Linear backscatter:
+        dB = 10 * log10(VV)
+
+    Already-dB data:
+        returned unchanged.
+
+    This prevents accidental double conversion.
     """
 
-    result = np.full_like(
+    vv = np.asarray(
         vv,
-        np.nan,
-        dtype=np.float32
+        dtype=np.float32,
     )
 
-    valid = (
-        np.isfinite(vv)
+    valid = np.isfinite(
+        vv
+    )
+
+    if not np.any(valid):
+
+        raise ValueError(
+            "No valid Sentinel-1 values available."
+        )
+
+    valid_values = vv[
+        valid
+    ]
+
+    # --------------------------------------------------------
+    # Detect whether values are already in dB.
+    #
+    # Linear Sentinel-1 backscatter should be positive.
+    # Presence of negative values is a strong indication
+    # that the image is already represented in dB.
+    # --------------------------------------------------------
+
+    negative_fraction = float(
+        np.mean(
+            valid_values < 0
+        )
+    )
+
+    if negative_fraction > 0.05:
+
+        print(
+            "Sentinel-1 input appears to already be in dB."
+        )
+
+        return vv.astype(
+            np.float32
+        )
+
+    # --------------------------------------------------------
+    # Otherwise treat input as linear backscatter.
+    # --------------------------------------------------------
+
+    db = np.full_like(
+        vv,
+        np.nan,
+        dtype=np.float32,
+    )
+
+    positive = (
+        valid
         & (vv > 0)
     )
 
-    result[valid] = (
-        10.0 * np.log10(vv[valid])
+    db[
+        positive
+    ] = (
+        10.0
+        * np.log10(
+            vv[positive]
+        )
     )
 
-    if not np.any(np.isfinite(result)):
+    return db.astype(
+        np.float32
+    )
+
+
+# ============================================================
+# SPECKLE FILTER
+# ============================================================
+
+def remove_speckle(
+    image,
+    size=3,
+):
+    """
+    Fast median speckle filtering.
+
+    NaN values are temporarily replaced during filtering
+    and restored afterwards.
+    """
+
+    image = np.asarray(
+        image,
+        dtype=np.float32,
+    )
+
+    if image.ndim != 2:
+
         raise ValueError(
-            "No valid positive Sentinel-1 VV values "
-            "available for dB conversion."
+            f"Expected 2D SAR image, got shape {image.shape}"
         )
 
-    return result
+    if size < 1:
 
-
-def remove_speckle(vv_db):
-    """
-    Simple 3x3 median filter.
-    """
-
-    valid_values = vv_db[
-        np.isfinite(vv_db)
-    ]
-
-    if valid_values.size == 0:
         raise ValueError(
-            "Cannot remove speckle: Sentinel-1 image "
-            "contains no valid dB pixels."
+            "size must be >= 1"
         )
+
+    if size % 2 == 0:
+
+        size += 1
+
+    try:
+
+        from scipy.ndimage import median_filter
+
+    except ImportError:
+
+        print(
+            "WARNING: scipy not installed. "
+            "Skipping speckle filtering."
+        )
+
+        return image
+
+    valid_mask = np.isfinite(
+        image
+    )
+
+    if not np.any(
+        valid_mask
+    ):
+
+        return image
 
     fill_value = float(
-        np.median(valid_values)
+        np.nanmedian(
+            image
+        )
     )
 
-    filled = np.where(
-        np.isfinite(vv_db),
-        vv_db,
-        fill_value
+    working = np.where(
+        valid_mask,
+        image,
+        fill_value,
+    ).astype(
+        np.float32
     )
 
     filtered = median_filter(
-        filled,
-        size=3
+        working,
+        size=size,
+        mode="nearest",
     )
 
     filtered[
-        ~np.isfinite(vv_db)
+        ~valid_mask
     ] = np.nan
 
-    return filtered
+    return filtered.astype(
+        np.float32
+    )

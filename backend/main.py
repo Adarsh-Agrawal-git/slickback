@@ -1,3 +1,4 @@
+import traceback
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -7,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from pipeline import run_pipeline
+from satellite.ais_live import refresh_live_ais
 
 
 # ============================================================
@@ -15,6 +17,11 @@ from pipeline import run_pipeline
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
+
+DATA_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
 
 # ============================================================
@@ -31,8 +38,6 @@ app = FastAPI(
 # CORS
 # ============================================================
 
-# "*" is intentional for the prototype deployment.
-# Once the final Vercel URL is known, this can be restricted.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -75,6 +80,7 @@ class SpillRequest(BaseModel):
 
 @app.get("/")
 def root():
+
     return {
         "name": "SlickBack",
         "status": "running",
@@ -84,6 +90,7 @@ def root():
 
 @app.get("/health")
 def health():
+
     return {
         "status": "ok",
     }
@@ -149,6 +156,13 @@ def analyze_spill(
         )
     )
 
+    ais_duration = int(
+        os.getenv(
+            "AIS_COLLECTION_SECONDS",
+            "30",
+        )
+    )
+
     # --------------------------------------------------------
     # TIME WINDOW
     # --------------------------------------------------------
@@ -162,9 +176,56 @@ def analyze_spill(
 
     end_datetime = request.observation_time
 
-    # --------------------------------------------------------
-    # PIPELINE
-    # --------------------------------------------------------
+    # ========================================================
+    # STEP 4
+    # REFRESH LIVE AIS DATA
+    # ========================================================
+
+    ais_refresh_result = None
+
+    try:
+
+        ais_refresh_result = refresh_live_ais(
+            latitude=request.spill_lat,
+            longitude=request.spill_lon,
+            radius_km=radius_km,
+            vessels_path=vessel_data_path,
+            history_path=ais_history_path,
+            duration_seconds=ais_duration,
+        )
+
+        print(
+            "LIVE AIS REFRESH COMPLETE:"
+        )
+
+        print(
+            ais_refresh_result
+        )
+
+    except Exception as error:
+
+        print(
+            "\n========== LIVE AIS ERROR =========="
+        )
+
+        traceback.print_exc()
+
+        print(
+            "====================================\n"
+        )
+
+        # Do NOT stop the entire pipeline if live AIS fails.
+        # The historical AIS data can still be used.
+
+        ais_refresh_result = {
+            "enabled": True,
+            "status": "failed",
+            "error": str(error),
+        }
+
+    # ========================================================
+    # RUN PIPELINE
+    # ========================================================
 
     try:
 
@@ -211,9 +272,29 @@ def analyze_spill(
             ),
         )
 
+        # ----------------------------------------------------
+        # ATTACH LIVE AIS INFORMATION
+        # ----------------------------------------------------
+
+        if isinstance(result, dict):
+
+            result["live_ais"] = (
+                ais_refresh_result
+            )
+
         return result
 
     except Exception as error:
+
+        print(
+            "\n========== PIPELINE ERROR =========="
+        )
+
+        traceback.print_exc()
+
+        print(
+            "====================================\n"
+        )
 
         raise HTTPException(
             status_code=500,
