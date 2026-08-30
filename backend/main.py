@@ -22,6 +22,7 @@ load_dotenv(BASE_DIR / ".env")
 # ============================================================
 
 from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -46,6 +47,17 @@ DATA_DIR.mkdir(
 app = FastAPI(
     title="SlickBack API",
     version="1.0.0",
+)
+# ============================================================
+# SERVE ANALYSIS FILES
+# ============================================================
+
+app.mount(
+    "/analysis-files",
+    StaticFiles(
+        directory=str(DATA_DIR)
+    ),
+    name="analysis-files",
 )
 
 
@@ -309,6 +321,34 @@ def analyze_spill(
             result["live_ais"] = (
                 ais_refresh_result
             )
+
+            # ------------------------------------------------
+            # SENTINEL-1 IMAGE URL
+            # ------------------------------------------------
+
+            satellite = result.get(
+                "satellite"
+            )
+
+            if isinstance(
+                satellite,
+                dict
+            ):
+
+                image_path = satellite.get(
+                    "image_path"
+                )
+
+                if image_path:
+
+                    image_name = Path(
+                        image_path
+                    ).name
+
+                    satellite["image_url"] = (
+                        "/analysis-files/"
+                        + image_name
+                    )
 
         return result
 

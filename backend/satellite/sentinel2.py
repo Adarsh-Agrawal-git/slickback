@@ -368,6 +368,26 @@ def find_sentinel2_scene(
     image = ee.Image(
         collection.first()
     )
+        # --------------------------------------------------------
+    # Browser preview of the ACTUAL selected Sentinel-2 scene.
+    # This is generated directly from the Earth Engine image
+    # used by the validation pipeline.
+    # --------------------------------------------------------
+
+    preview_region = geometry
+
+    preview_url = image.getThumbURL({
+        "bands": [
+            "B4",
+            "B3",
+            "B2",
+        ],
+        "min": 0,
+        "max": 3000,
+        "region": preview_region,
+        "dimensions": 800,
+        "format": "png",
+    })
 
     # --------------------------------------------------------
     # Metadata.
@@ -458,6 +478,7 @@ def find_sentinel2_scene(
 
     return {
         "image": image,
+        "preview_url": preview_url,
         "scene_id": scene_id,
         "acquisition_time": (
             acquisition_datetime

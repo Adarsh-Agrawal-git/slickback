@@ -1009,16 +1009,49 @@ def run_pipeline(
         # ====================================================
 
         results.append({
-            "candidate": candidate,
+    "candidate": candidate,
 
-            "environmental_hindcast": (
-                environmental_hindcast
-            ),
+    "environmental_hindcast": (
+        environmental_hindcast
+    ),
 
-            "nearby_vessels": (
-                investigated_vessels
-            ),
-        })
+    "backtracking": {
+        "particle_count": len(particle_lats),
+        "hours_back": hours_back,
+        "source_lat": round(
+            source_latitude,
+            6,
+        ),
+        "source_lon": round(
+            source_longitude,
+            6,
+        ),
+        "uncertainty_radius_km": round(
+            source_uncertainty_km,
+            2,
+        ),
+        "path": [
+            {
+                "latitude": round(
+                    float(lat),
+                    6,
+                ),
+                "longitude": round(
+                    float(lon),
+                    6,
+                ),
+            }
+            for lat, lon in zip(
+                particle_lats,
+                particle_lons,
+            )
+        ],
+    },
+
+    "nearby_vessels": (
+        investigated_vessels
+    ),
+})
 
     # ========================================================
     # FINAL RESPONSE
@@ -1068,8 +1101,13 @@ def run_pipeline(
         "status": "success",
 
         "satellite": {
-            "source": "Google Earth Engine",
-            "catalog": "COPERNICUS/S1_GRD",
+    "source": "Google Earth Engine",
+
+    "image_path": str(
+        image_path
+    ),
+
+    "catalog": "COPERNICUS/S1_GRD",
             "mission": "Sentinel-1",
             "product": "Sentinel-1 GRD",
 
@@ -1119,6 +1157,7 @@ def run_pipeline(
                 ]
             ),
         },
+        
 
         "detection": {
             "candidate_count": len(
