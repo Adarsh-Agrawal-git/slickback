@@ -209,14 +209,6 @@ def find_sentinel2_scene(
             start_time.isoformat(),
             end_time.isoformat(),
         )
-        .filter(
-            ee.Filter.lte(
-                "CLOUDY_PIXEL_PERCENTAGE",
-                float(
-                    max_cloud_percentage
-                ),
-            )
-        )
     )
 
     # --------------------------------------------------------
@@ -292,12 +284,18 @@ def find_sentinel2_scene(
             )
         )
 
-        time_difference_hours = (
-            ee.Number(
-                image.get(
-                    "time_difference"
-                )
+        image_time = ee.Number(
+            image.get(
+                "system:time_start"
             )
+        )
+
+        time_difference_hours = (
+            image_time
+            .subtract(
+                target_millis
+            )
+            .abs()
             .divide(
                 1000 * 60 * 60
             )
@@ -311,13 +309,57 @@ def find_sentinel2_scene(
         )
 
         return image.set(
+            "time_difference",
+            time_difference_hours
+        ).set(
             "scene_score",
-            scene_score,
+            scene_score
         )
 
     collection = collection.map(
         add_scene_score
+    )  
+
+    # --------------------------------------------------------
+    # Prefer scenes with usable scene-level cloud cover.
+    #
+    # Scenes <= 60% cloud are preferred.
+    # If none exist, retain the least-cloudy available scenes
+    # rather than failing S2 completely.
+    # --------------------------------------------------------
+
+    usable_collection = collection.filter(
+        ee.Filter.lte(
+            "CLOUDY_PIXEL_PERCENTAGE",
+            60,
+        )
     )
+
+    usable_count = usable_collection.size().getInfo()
+
+    if usable_count > 0:
+
+        print(
+            "Sentinel-2 usable scenes (cloud <= 60%):",
+            usable_count,
+        )
+
+        collection = usable_collection
+
+    else:
+
+        print(
+            "WARNING: No Sentinel-2 scene has cloud <= 60%."
+        )
+
+        print(
+            "Using the least-cloudy available scene "
+            "for candidate-level SCL validation."
+        )
+
+    # --------------------------------------------------------
+    # Re-score after filtering.
+    # --------------------------------------------------------
 
     collection = collection.sort(
         "scene_score"
@@ -980,39 +1022,28 @@ def validate_sentinel2_candidate(
         scene["cloud_percentage"]
     )
 
+        # --------------------------------------------------------
+    # Candidate-level cloud validation
     # --------------------------------------------------------
-    # Extra protection.
     #
-    # Even though the collection filter already rejects scenes
-    # above 60%, keep this guard here so future changes to the
-    # search function cannot accidentally allow a highly cloudy
-    # scene into the validation stage.
+    # Do not reject a scene using whole-scene cloud percentage.
+    # A scene may be cloudy elsewhere while the SAR candidate
+    # itself is clear.
+    #
+    # The SCL mask inside analyze_optical_candidate() performs
+    # the actual pixel-level cloud/shadow filtering.
     # --------------------------------------------------------
 
     if cloud_percentage > 60:
 
         print(
-            "Sentinel-2 scene is too cloudy:",
+            "Sentinel-2 scene has high scene-level cloud cover:",
             cloud_percentage,
         )
 
-        return {
-            "available": True,
-            "validated": False,
-            "validation": "CLOUD_OBSCURED",
-            "confidence": 0.0,
-            "cloud_percentage": cloud_percentage,
-            "scene_id": scene["scene_id"],
-            "acquisition_time": (
-                scene[
-                    "acquisition_time"
-                ].isoformat()
-            ),
-            "reason": (
-                "Selected Sentinel-2 scene exceeds "
-                "the usable cloud threshold."
-            ),
-        }
+        print(
+            "Proceeding with candidate-level SCL cloud assessment..."
+        )
 
     try:
 
