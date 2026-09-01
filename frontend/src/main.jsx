@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   MapContainer,
@@ -65,6 +65,55 @@ function Icon({ name, size = 17 }) {
     expand: <><path d="M8 3H3v5M16 3h5v5M21 16v5h-5M3 16v5h5"/></>,
   };
   return <svg {...p}>{paths[name] || paths.target}</svg>;
+}
+
+function MapViewStyles() {
+  return (
+    <style>{`
+      .basemap-switch {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+        padding: 2px;
+        border: 1px solid rgba(71, 126, 139, .38);
+        border-radius: 7px;
+        background: rgba(5, 18, 24, .82);
+      }
+      .basemap-switch button {
+        border: 0;
+        border-radius: 5px;
+        background: transparent;
+        color: #7f9ca6;
+        font: 700 9px/1.2 inherit;
+        letter-spacing: .12em;
+        padding: 7px 8px;
+        cursor: pointer;
+      }
+      .basemap-switch button:hover,
+      .basemap-switch button.active {
+        color: #071317;
+        background: #28d1c5;
+      }
+      .sar-preview-empty {
+        min-height: 220px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        color: #8aa5ad;
+        border: 1px dashed rgba(111, 155, 164, .3);
+        background: rgba(2, 12, 17, .55);
+        font-size: 11px;
+      }
+      .legend-basemap {
+        opacity: .85;
+        letter-spacing: .08em;
+      }
+      .sb-map-wrap.selecting .leaflet-container {
+        cursor: crosshair !important;
+      }
+    `}</style>
+  );
 }
 
 function num(v, digits = 2) {
@@ -153,7 +202,7 @@ function MapFocus({ point }) {
   React.useEffect(() => {
     if (point?.lat == null || point?.lon == null) return;
     map.flyTo([Number(point.lat), Number(point.lon)], 11, { duration: 0.65 });
-  }, [point, map]);
+}, [point?.lat, point?.lon, point?.token, map]);
   return null;
 }
 
@@ -247,12 +296,63 @@ function App() {
   const [focusPoint, setFocusPoint] = useState(null);
   const [mapSelectedPoint, setMapSelectedPoint] = useState(null);
   const [mapSelectMode, setMapSelectMode] = useState(false);
+  const [basemap, setBasemap] = useState("satellite");
+  const [sarImageFailed, setSarImageFailed] = useState(false);
+  const [sarPreviewIndex, setSarPreviewIndex] = useState(0);
 
   const model = useMemo(() => (data ? normalize(data) : null), [data]);
-  const sarPreviewUrl = useMemo(
-    () => `${API}/analysis-files/sentinel1_preview.png?analysis=${Date.now()}`,
-    [data]
-  );
+  const sarPreviewCandidates = useMemo(() => {
+    if (!data) return [];
+
+    const rawValues = [
+      data?.satellite?.image_path,
+      data?.satellite?.preview_path,
+      data?.satellite?.image_url,
+      data?.satellite?.image,
+      data?.analysis?.satellite?.image_path,
+      data?.analysis?.satellite?.preview_path,
+      data?.analysis?.satellite?.image_url,
+      data?.analysis?.image_path,
+      data?.analysis?.preview_path,
+    ];
+
+    const urls = rawValues
+      .filter((value) => value !== undefined && value !== null && String(value).trim() !== "")
+      .map((value) => {
+        const raw = String(value).trim();
+
+        if (/^https?:\/\//i.test(raw)) {
+          return `${raw}${raw.includes("?") ? "&" : "?"}analysis=${encodeURIComponent(data?.analysis_id || Date.now())}`;
+        }
+
+        const clean = raw.replace(/\\/g, "/").replace(/^\.\//, "");
+        let relative;
+
+        if (clean.startsWith("/analysis-files/")) {
+          relative = clean;
+        } else if (clean.includes("analysis-files/")) {
+          relative = `/${clean.substring(clean.indexOf("analysis-files/"))}`;
+        } else {
+          const filename = clean.split("/").filter(Boolean).pop();
+          relative = filename ? `/analysis-files/${filename}` : null;
+        }
+
+        if (!relative) return null;
+
+        return `${API}${relative}${relative.includes("?") ? "&" : "?"}analysis=${encodeURIComponent(data?.analysis_id || Date.now())}`;
+      })
+      .filter(Boolean);
+
+    return [...new Set(urls)];
+  }, [data]);
+
+  const sarPreviewUrl = sarPreviewCandidates[sarPreviewIndex] || null;
+
+  React.useEffect(() => {
+    setSarPreviewIndex(0);
+    setSarImageFailed(false);
+  }, [data]);
+
   const visibleCandidates = useMemo(() => {
     if (!model?.candidates) return [];
     return [...model.candidates]
@@ -271,14 +371,15 @@ function App() {
     );
   }, [visibleCandidates, search]);
 
-  const investigationLeads = useMemo(
-    () =>
-      vessels.filter((v) => {
-        const a = String(v.assessment || "").toUpperCase();
-        return a.includes("INVESTIGATION") || a.includes("INTENTIONAL");
-      }).length,
-    [vessels]
-  );
+  const qualifiedLeads = useMemo(
+  () =>
+    vessels.filter((v) =>
+      String(v.priority || "")
+        .toUpperCase()
+        .startsWith("HIGH PRIORITY")
+    ).length,
+  [vessels]
+);
 
   const maxScore = useMemo(
     () => Math.max(1, ...vessels.map((v) => Number(v.score) || 0)),
@@ -333,49 +434,93 @@ function App() {
     return () => clearInterval(id);
   }, [playing, hours]);
 
-  async function runAnalysis(nextHours = hours) {
-    const cleanHours = Math.max(1, Math.min(48, Number(nextHours) || 48));
-    setHours(cleanHours);
-    setLoading(true);
-    setError("");
-    setData(null);
-    setActiveTab("overview");
-    setCandidateIndex(0);
-    setVesselIndex(0);
-    setRewindHour(cleanHours);
-    setPlaying(false);
+async function runAnalysis(nextHours = hours) {
+  const cleanLat = Number(lat);
+  const cleanLon = Number(lon);
+  const cleanHours = Math.max(
+    1,
+    Math.min(48, Number(nextHours) || 48)
+  );
+
+  if (!Number.isFinite(cleanLat) || cleanLat < -90 || cleanLat > 90) {
+    setError("Latitude must be a number between -90 and 90 degrees.");
+    return;
+  }
+
+  if (!Number.isFinite(cleanLon) || cleanLon < -180 || cleanLon > 180) {
+    setError("Longitude must be a number between -180 and 180 degrees.");
+    return;
+  }
+
+  setLat(cleanLat);
+  setLon(cleanLon);
+  setHours(cleanHours);
+  setLoading(true);
+  setError("");
+  setData(null);
+  setActiveTab("overview");
+  setCandidateIndex(0);
+  setVesselIndex(0);
+  setRewindHour(cleanHours);
+  setPlaying(false);
+  setSarPreviewIndex(0);
+  setSarImageFailed(false);
+
+  try {
+    const response = await fetch(`${API}/analyze-spill`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        spill_lat: cleanLat,
+        spill_lon: cleanLon,
+        observation_time: time,
+        hours_back: cleanHours,
+      }),
+    });
+
+    let json;
 
     try {
-      const response = await fetch(`${API}/analyze-spill`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          spill_lat: Number(lat),
-          spill_lon: Number(lon),
-          observation_time: time,
-          hours_back: cleanHours,
-        }),
-      });
-      let json = null;
-      try {
-        json = await response.json();
-      } catch {
-        throw new Error(`Backend returned ${response.status} without valid JSON.`);
-      }
-      if (!response.ok) {
-        throw new Error(json?.detail || `Backend returned ${response.status}`);
-      }
-      if (json?.status && !["success", "completed"].includes(String(json.status).toLowerCase())) {
-        throw new Error(json?.detail || "Analysis did not complete successfully.");
-      }
-      setData(json);
-    } catch (e) {
-      console.error(e);
-      setError(e?.message || "Unable to reach the analysis service.");
-    } finally {
-      setLoading(false);
+      json = await response.json();
+    } catch {
+      throw new Error(
+        `Backend returned ${response.status} without valid JSON.`
+      );
     }
+
+    if (!response.ok) {
+      throw new Error(
+        json?.detail || `Backend returned ${response.status}`
+      );
+    }
+
+    if (
+      json?.status &&
+      !["success", "completed"].includes(
+        String(json.status).toLowerCase()
+      )
+    ) {
+      throw new Error(
+        json?.detail || "Analysis did not complete successfully."
+      );
+    }
+
+    if (!json || typeof json !== "object") {
+      throw new Error("Analysis service returned an empty response.");
+    }
+
+    setData(json);
+  } catch (e) {
+    console.error("SlickBack analysis error:", e);
+    setError(
+      e?.message || "Unable to reach the analysis service."
+    );
+  } finally {
+    setLoading(false);
   }
+}
 
   function selectCandidate(index) {
     setCandidateIndex(index);
@@ -394,12 +539,33 @@ function App() {
     setPlaying(false);
   }
 
-  function focusIncident() {
-    const point = candidate && candidate.lat != null
-      ? { lat: candidate.lat, lon: candidate.lon }
-      : { lat: Number(lat), lon: Number(lon) };
-    setFocusPoint({ ...point, token: Date.now() });
+function focusIncident() {
+  const point =
+    candidate &&
+    candidate.lat != null &&
+    candidate.lon != null
+      ? {
+          lat: Number(candidate.lat),
+          lon: Number(candidate.lon),
+        }
+      : {
+          lat: Number(lat),
+          lon: Number(lon),
+        };
+
+  if (
+    !Number.isFinite(point.lat) ||
+    !Number.isFinite(point.lon)
+  ) {
+    return;
   }
+
+  setFocusPoint({
+    lat: point.lat,
+    lon: point.lon,
+    token: Date.now(),
+  });
+}
 
   function selectMapLocation(latitude, longitude) {
     setLat(latitude);
@@ -455,7 +621,8 @@ function App() {
     line(`Candidate median backscatter: ${fmt(candidate.median, 2, " dB")}`);
     line(`Adaptive threshold: ${fmt(model.detection?.adaptive_threshold_db, 2, " dB")}`);
     try {
-      const imageData = await loadImageDataUrl(`${API}/analysis-files/sentinel1_preview.png?report=${Date.now()}`);
+      if (!sarPreviewUrl) throw new Error("No analysis-specific Sentinel-1 image was returned.");
+      const imageData = await loadImageDataUrl(sarPreviewUrl);
       if (y > pageHeight - 300) { doc.addPage(); y = 48; }
       heading("3. SENTINEL-1 ANALYSIS PREVIEW");
       const imageHeight = Math.min(270, contentWidth * 0.72);
@@ -477,7 +644,10 @@ function App() {
     if (!reportVessels.length) line("No vessel records were returned for the selected candidate.");
     reportVessels.forEach((v, i) => {
       line(`${i + 1}. ${v.name} · MMSI ${v.mmsi}`);
-      line(`Priority ${fmt(v.score, 1)} · correlation ${fmt(v.correlation, 3)} · distance ${fmt(v.distance, 1, " km")} · AIS gap ${fmt(v.gap, 1, " h")}`, 12);
+     line(
+  `Investigation score ${fmt(v.score, 1)} · correlation ${fmt(v.correlation, 3)} · distance ${fmt(v.distance, 1, " km")} · AIS gap ${fmt(v.gap, 1, " h")}`,
+  12
+);
       line(`Trajectory ${v.trajectory ? "compatible" : "not confirmed"} · reachability ${v.reachable ? "supported" : "not supported"} · assessment ${v.assessment}`, 12);
     });
     heading("6. ENVIRONMENTAL HINDCAST / SOURCE RECONSTRUCTION");
@@ -509,6 +679,7 @@ function App() {
 
   return (
     <div className="sb-shell">
+      <MapViewStyles />
       <aside className="sb-sidebar">
         <div className="sb-brand">
           <div className="sb-mark">S</div>
@@ -597,6 +768,24 @@ function App() {
               <div className="sb-map-head-actions">
                 <span className="live-map"><i className="dot live"/> LIVE MAP</span>
                 <button onClick={() => setLayersOpen((v) => !v)}><Icon name="layers" size={14}/> LAYERS</button>
+                <div className="basemap-switch" role="group" aria-label="Map view">
+                  <button
+                    type="button"
+                    className={basemap === "satellite" ? "active" : ""}
+                    onClick={() => setBasemap("satellite")}
+                    title="Satellite imagery"
+                  >
+                    SATELLITE
+                  </button>
+                  <button
+                    type="button"
+                    className={basemap === "street" ? "active" : ""}
+                    onClick={() => setBasemap("street")}
+                    title="Street map"
+                  >
+                    STREET
+                  </button>
+                </div>
                 <button className={mapSelectMode ? "active" : ""} onClick={() => setMapSelectMode((v) => !v)}><Icon name="mapPin" size={14}/> {mapSelectMode ? "SELECTING" : "SELECT LOCATION"}</button>
                 <button onClick={focusIncident} disabled={loading}><Icon name="target" size={14}/> FOCUS</button>
               </div>
@@ -606,10 +795,21 @@ function App() {
               <MapContainer center={mapCenter} zoom={8} className="sb-map" scrollWheelZoom>
                  <MapClickHandler onSelect={selectMapLocation} enabled={mapSelectMode}/>
                  {focusPoint && <MapFocus point={focusPoint}/>}
-                <TileLayer
-                  attribution='&copy; Esri'
-                  url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-                />
+                {basemap === "street" ? (
+                  <TileLayer
+                    key="street-basemap"
+                    attribution='&copy; OpenStreetMap contributors'
+                    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                    maxZoom={19}
+                  />
+                ) : (
+                  <TileLayer
+                    key="satellite-basemap"
+                    attribution='&copy; Esri'
+                    url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+                    maxZoom={19}
+                  />
+                )}
 
                 {mapSelectedPoint && (
                   <Marker position={[mapSelectedPoint.lat, mapSelectedPoint.lon]} icon={L.divIcon({ className: "slickback-selection-pin", html: `<div><span></span></div>`, iconSize: [24,24], iconAnchor: [12,12] })}>
@@ -674,14 +874,16 @@ function App() {
                 <div className="map-select-banner"><Icon name="mapPin" size={13}/> CLICK ANYWHERE ON THE MAP TO SET THE ANALYSIS LOCATION</div>
               )}
 
-              {!model && !loading && (
-                <div className="map-empty">
-                  <div className="radar-orbit"><i/><b/></div>
-                  <strong>Ready for investigation</strong>
-                  <span>Enter the incident parameters and run the evidence pipeline.</span>
-                  <button onClick={() => runAnalysis()}>START ANALYSIS <Icon name="arrow" size={13}/></button>
-                </div>
-              )}
+            {!model && !loading && !mapSelectMode && (
+  <div className="map-empty">
+    <div className="radar-orbit"><i/><b/></div>
+    <strong>Ready for investigation</strong>
+    <span>Enter the incident parameters and run the evidence pipeline.</span>
+    <button onClick={() => runAnalysis()}>
+      START ANALYSIS <Icon name="arrow" size={13}/>
+    </button>
+  </div>
+)}
 
               {loading && (
                 <div className="map-loading">
@@ -708,6 +910,9 @@ function App() {
                 <span><i className="legend-vessel"/> AIS vessel</span>
                 <span><i className="legend-history"/> Historical</span>
                 <span><i className="legend-route"/> Movement</span>
+               <span className="legend-basemap">
+  {basemap === "street" ? "STANDARD MAP" : "SATELLITE"}
+</span>
               </div>
             </div>
 
@@ -761,11 +966,38 @@ function App() {
 
             {model && !loading && (
               <>
-                <div className="sb-kpis">
-                  <Metric label="SAR SOURCE" value={model.satellite?.mission || "Sentinel-1"} />
-                  <Metric label="SAR SIGNALS" value={`${visibleCandidates.length} / ${model.candidates.length}`} accent />
-                  <Metric label="LEADS" value={investigationLeads} />
-                </div>
+           <div className="sb-kpis">
+  <Metric
+    label="SAR SOURCE"
+    value={model.satellite?.mission || "Sentinel-1"}
+  />
+
+  <Metric
+    label="SAR SIGNALS"
+    value={`${visibleCandidates.length} / ${model.candidates.length}`}
+    accent
+  />
+
+  <Metric
+    label="QUALIFIED LEADS"
+    value={qualifiedLeads}
+  />
+</div>
+
+{qualifiedLeads === 0 && vessels.length > 0 && (
+  <div
+    className="sb-inline-note"
+    role="status"
+    aria-live="polite"
+  >
+    <Icon name="alert" size={13} />
+    <span>
+      No vessel currently meets the high-priority investigation criteria
+      for the selected candidate. Nearby AIS records remain correlation
+      evidence for analyst review.
+    </span>
+  </div>
+)}
 
                 <div className="sb-tabs">
                   <button className={activeTab === "overview" ? "active" : ""} onClick={() => setActiveTab("overview")}>OVERVIEW</button>
@@ -797,10 +1029,38 @@ function App() {
                     <div className="sar-preview-card">
                       <div className="sar-preview-head">
                         <div><span>SENTINEL-1 EVIDENCE</span><strong>Actual analysis image</strong></div>
-                        <a href={sarPreviewUrl} target="_blank" rel="noreferrer">OPEN FULL</a>
+                        {sarPreviewUrl && (
+                          <a href={sarPreviewUrl} target="_blank" rel="noreferrer">OPEN FULL</a>
+                        )}
                       </div>
-                      <img src={sarPreviewUrl} alt="Sentinel-1 analysis preview used by SlickBack"/>
-                      <small>Generated by the backend analysis pipeline · not a generic basemap.</small>
+                      {sarPreviewUrl && !sarImageFailed ? (
+                        <img
+                          key={sarPreviewUrl}
+                          src={sarPreviewUrl}
+                          alt="Sentinel-1 analysis image returned for this investigation"
+                          loading="eager"
+                          decoding="async"
+                          onError={() => {
+                            if (sarPreviewIndex + 1 < sarPreviewCandidates.length) {
+                              setSarPreviewIndex((i) => i + 1);
+                            } else {
+                              setSarImageFailed(true);
+                            }
+                          }}
+                        />
+                      ) : (
+                        <div className="sar-preview-empty">
+                          <Icon name="alert" size={18}/>
+                          <span>
+                            {sarImageFailed
+                              ? "Sentinel-1 evidence image could not be loaded from the analysis service."
+                              : sarPreviewCandidates.length
+                                ? "Loading Sentinel-1 evidence image..."
+                                : "No analysis-specific Sentinel-1 image was returned."}
+                          </span>
+                        </div>
+                      )}
+                      <small>Generated by the backend analysis pipeline for this investigation · not a generic basemap.</small>
                     </div>
 
                     <div className="metric-grid four">
@@ -810,7 +1070,10 @@ function App() {
                       <Metric label="THRESHOLD" value={fmt(model.detection?.adaptive_threshold_db,2," dB")} />
                     </div>
 
-                    <div className="section-heading"><span>VESSEL LEADS</span><b>{vessels.length} CORRELATED</b></div>
+                   <div className="section-heading">
+  <span>VESSEL CORRELATION</span>
+  <b>{vessels.length} CORRELATED</b>
+</div>
                     <div className="vessel-list">
                       {vessels.length ? vessels.slice(0, 8).map((v, i) => (
                         <button className={`vessel-row ${i === vesselIndex ? "selected" : ""}`} key={`${v.mmsi}-${i}`} onClick={() => { setVesselIndex(i); setActiveTab("vessel"); }}>
@@ -829,7 +1092,11 @@ function App() {
                     {!vessel ? <div className="no-vessels">Select a vessel lead from the overview.</div> : (
                       <>
                         <div className="lead-identity">
-                          <div><span>SELECTED LEAD</span><h3>{vessel.name}</h3><small>MMSI {vessel.mmsi}</small></div>
+                          <div>
+  <span>SELECTED VESSEL</span>
+  <h3>{vessel.name}</h3>
+  <small>MMSI {vessel.mmsi}</small>
+</div>
                           <div className="lead-priority"><span>PRIORITY</span><strong>{fmt(vessel.score,1)}</strong></div>
                         </div>
                         <span className={`priority-badge ${assessmentTone(vessel.assessment)}`}>{vessel.priority}</span>
@@ -843,8 +1110,10 @@ function App() {
                           <Metric label="EVIDENCE" value={fmt(vessel.evidence,1)} />
                         </div>
 
-                        <div className="fusion-card">
-                          <div className="fusion-title"><span>EVIDENCE FUSION</span><b>WHY THIS LEAD?</b></div>
+                        <div className="fusion-card"><div className="fusion-title">
+  <span>EVIDENCE FUSION</span>
+  <b>WHY THIS VESSEL?</b>
+</div>
                           <EvidenceBar label="AIS correlation" value={(vessel.correlation || 0) * 100}/>
                           <EvidenceBar label="Investigation evidence" value={(vessel.evidence || 0) * 10}/>
                           <EvidenceBar label="Priority score" value={((vessel.score || 0) / maxScore) * 100} note={fmt(vessel.score,1)}/>
@@ -885,9 +1154,39 @@ function App() {
         </section>
 
         <section className="sb-bottom">
-          <div><span>SAR DETECTION</span><strong>{model ? Math.min(MAX_VISIBLE_CANDIDATES, model.candidates.length) : "—"}</strong><small>{model ? `top candidates of ${model.candidates.length}` : "surfaced candidates"}</small><em>{model?.satellite?.mission || "Sentinel-1"}</em></div>
+         <div>
+  <span>SAR DETECTION</span>
+
+  <strong>
+    {model
+      ? Math.min(MAX_VISIBLE_CANDIDATES, model.candidates.length)
+      : "—"}
+  </strong>
+
+  <small>
+    {model
+      ? `highest-priority of ${model.candidates.length} returned`
+      : "surfaced candidates"}
+  </small>
+
+  <em>{model?.satellite?.mission || "Sentinel-1"}</em>
+</div>
           <div><span>AIS CORRELATION</span><strong>{vessels.length || "—"}</strong><small>nearby vessel records</small><em>{hours}H window</em></div>
-          <div><span>LEAD PRIORITY</span><strong>{vessel ? fmt(vessel.score,1) : "—"}</strong><small>{vessel?.name || "No lead selected"}</small><em>{vessel ? "REVIEW" : "WAITING"}</em></div>
+          <div>
+  <span>TOP VESSEL SCORE</span>
+
+  <strong>
+    {vessel ? fmt(vessel.score, 1) : "—"}
+  </strong>
+
+  <small>
+    {vessel?.name || "No vessel selected"}
+  </small>
+
+  <em>
+    {vessel ? "CORRELATION REVIEW" : "WAITING"}
+  </em>
+</div>
           <div><span>RECONSTRUCTION</span><strong>{vessel?.gap != null ? fmt(vessel.gap,1,"H") : "—"}</strong><small>AIS continuity gap</small><em>{vessel?.trajectory ? "TRAJECTORY OK" : "REVIEW"}</em></div>
         </section>
 

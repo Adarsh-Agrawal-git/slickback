@@ -18,6 +18,8 @@ from satellite.sentinel1 import (
     pixel_to_latlon,
 )
 
+from satellite.image_preview import create_sentinel1_preview
+
 from satellite.preprocess import (
     load_sentinel1,
     to_db,
@@ -139,6 +141,35 @@ def run_pipeline(
 
     image_path = acquisition["path"]
     bbox = acquisition["bbox"]
+
+    # ========================================================
+    # 1A. CREATE BROWSER-FRIENDLY SENTINEL-1 PREVIEW
+    # ========================================================
+    # The scientific TIFF is used by the detection pipeline.
+    # Browsers should not be asked to render that TIFF directly.
+    # Create a PNG from the exact same downloaded Sentinel-1
+    # raster so the dashboard displays the real analysis data.
+
+    preview_path = (
+        image_path.parent
+        / "sentinel1_preview.png"
+        if hasattr(image_path, "parent")
+        else None
+    )
+
+    if preview_path is None:
+        from pathlib import Path
+        image_path = Path(image_path)
+        preview_path = image_path.parent / "sentinel1_preview.png"
+
+    print("Creating Sentinel-1 browser preview...")
+
+    create_sentinel1_preview(
+        input_path=image_path,
+        output_path=preview_path,
+    )
+
+    print("Sentinel-1 preview:", preview_path)
 
     # ========================================================
     # 2. REAL SENTINEL-1 METADATA
@@ -337,7 +368,7 @@ def run_pipeline(
     # Investigate only the strongest candidates. This prevents
     # 50+ weak dark regions from triggering repeated environmental
     # and AIS processing.
-    max_investigation_candidates = 12
+    max_investigation_candidates = 5
 
     candidate_features = candidate_features[
         :max_investigation_candidates
@@ -1101,11 +1132,17 @@ def run_pipeline(
         "status": "success",
 
         "satellite": {
-    "source": "Google Earth Engine",
+            "source": "Google Earth Engine",
 
-    "image_path": str(
-        image_path
-    ),
+            # Scientific source raster used by the detector.
+            "image_path": str(
+                image_path
+            ),
+
+            # Browser/PDF-friendly rendering of that exact raster.
+            "preview_path": str(
+                preview_path
+            ),
 
     "catalog": "COPERNICUS/S1_GRD",
             "mission": "Sentinel-1",

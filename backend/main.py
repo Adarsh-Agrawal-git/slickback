@@ -335,16 +335,29 @@ def analyze_spill(
                 dict
             ):
 
+                # Prefer the browser-safe PNG preview. Keep the
+                # scientific TIFF path separately for the pipeline.
+                preview_path = satellite.get(
+                    "preview_path"
+                )
+
+                if preview_path:
+                    preview_name = Path(
+                        preview_path
+                    ).name
+                    satellite["preview_url"] = (
+                        "/analysis-files/"
+                        + preview_name
+                    )
+
                 image_path = satellite.get(
                     "image_path"
                 )
 
                 if image_path:
-
                     image_name = Path(
                         image_path
                     ).name
-
                     satellite["image_url"] = (
                         "/analysis-files/"
                         + image_name
